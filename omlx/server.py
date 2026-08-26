@@ -70,6 +70,7 @@ from .api.anthropic_models import (
     TokenCountResponse,
 )
 from .api.anthropic_utils import (
+    classifier_envelope_drift,
     convert_anthropic_to_internal,
     convert_anthropic_to_internal_harmony,
     convert_anthropic_tools_to_internal,
@@ -83,6 +84,7 @@ from .api.anthropic_utils import (
     create_message_stop_event,
     create_text_delta_event,
     create_thinking_delta_event,
+    is_auto_mode_classifier_request,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -5628,6 +5630,30 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
+        elif is_auto_mode_classifier_request(request):
+            # Claude Code's auto-mode Bash safety classifier sends no thinking
+            # field at all, so a reasoning model would fall through to its own
+            # default and reason past Claude Code's ~35-45s deadline. The
+            # request is then cancelled and the user sees "model is temporarily
+            # unavailable" (#1). Treat it as if the client had asked for
+            # thinking to be disabled — same path, same forced-key precedence,
+            # no new behavior. The `elif` is the safety property: a request
+            # that states its own thinking preference never reaches here.
+            if "enable_thinking" not in forced_keys:
+                merged_ct_kwargs["enable_thinking"] = False
+                drift = classifier_envelope_drift(request)
+                if drift:
+                    logger.warning(
+                        "Auto-mode classifier matched on the system marker but "
+                        "its envelope drifted (%s); disabling thinking anyway. "
+                        "Claude Code may have changed the request format.",
+                        "; ".join(drift),
+                    )
+                else:
+                    logger.info(
+                        "Auto-mode classifier detected; disabling thinking for "
+                        "this request"
+                    )
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
