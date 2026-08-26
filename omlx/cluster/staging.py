@@ -1194,7 +1194,9 @@ def remote_model_dir(
         timeout=timeout,
     )
     if not isinstance(path, str) or not path:
-        raise RuntimeError(f"invalid model directory from {ssh_target}")
+        raise RuntimeError(
+            f"invalid model directory for {model_dir!r} from {ssh_target}"
+        )
     return path
 
 
@@ -1314,13 +1316,11 @@ def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
 
     if ssh_target and not is_local_host(ssh_target):
         result = subprocess.run(
-            # Unquoted so the remote shell expands ~; the path comes from a
-            # validated model directory, not user text.
             [
                 "ssh",
                 *cluster_ssh_options(connect_timeout=10),
                 ssh_target,
-                f"df -k {path} | tail -1",
+                f"df -k {shlex.quote(str(path))} | tail -1",
             ],
             capture_output=True,
             text=True,
