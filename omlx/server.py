@@ -4251,6 +4251,17 @@ def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
     return False
 
 
+class InvalidReasoningParserError(ValueError):
+    """Raised when a model's configured ``reasoning_parser`` name is not one
+    xgrammar recognizes.
+
+    Distinguished from a generic grammar-compilation failure (#4): this means
+    the *configuration* is wrong, not that a valid grammar failed to compile.
+    Callers should report this differently so an operator looks at the
+    model's reasoning_parser setting instead of the request's grammar.
+    """
+
+
 def _compile_with_structural_tag(
     compiler, fmt: dict, reasoning_parser: str, chat_template_kwargs: dict | None
 ):
@@ -4268,7 +4279,13 @@ def _compile_with_structural_tag(
     reasoning = not (
         chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False
     )
-    tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
+    try:
+        tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
+    except ValueError as e:
+        raise InvalidReasoningParserError(
+            f"Invalid reasoning_parser '{reasoning_parser}' configured for "
+            f"this model: {e}"
+        ) from e
     tag_dict = tag.model_dump()
     if not _patch_output_format(tag_dict, fmt):
         logger.warning(
@@ -4349,7 +4366,7 @@ def _compile_grammar_for_request(
 ):
     """Compile a grammar from structured_outputs or response_format.
 
-    When ``reasoning_parser`` is set (e.g. ``"qwen"``, ``"harmony"``),
+    When ``reasoning_parser`` is set (e.g. ``"qwen_3_5"``, ``"harmony"``),
     the user's grammar is wrapped in an xgrammar builtin structural tag
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
@@ -4405,6 +4422,10 @@ def _compile_grammar_for_request(
                 chat_template_kwargs,
             )
         return _compile_bare_grammar(compiler, fmt)
+    except InvalidReasoningParserError as e:
+        if structured_outputs is not None:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        _warn_response_format_not_enforced(response_format, error=e)
     except Exception as e:
         if structured_outputs is not None:
             raise HTTPException(

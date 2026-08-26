@@ -1785,9 +1785,9 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
-@router.get("/api/grammar/parsers")
-async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
-    """Return available reasoning parser names from xgrammar.
+def _reasoning_parser_registry() -> dict[str, list[str]] | None:
+    """Return ``{style: supported_model_names}`` for xgrammar's builtin
+    reasoning parsers, or ``None`` if the registry can't be determined.
 
     Supports both API generations:
 
@@ -1797,8 +1797,11 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
       ``get_builtin_structural_tag_supported_models()``.
 
-    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
-    binding on macOS arm64), or has neither API available.
+    Returns ``None`` if xgrammar is missing, fails to load (e.g. broken
+    native binding on macOS arm64), or has neither API available. Shared by
+    :func:`list_grammar_parsers` (the admin UI dropdown) and
+    ``update_model_settings`` (write-time validation) so both check the same
+    source of truth (#4).
     """
     # Install the torch stub BEFORE any xgrammar import. If this lives
     # inside the first try-block, a failure on the 0.1.34+ path can leave
@@ -1816,10 +1819,10 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     try:
         from xgrammar.builtin_structural_tag import _structural_tag_registry
 
-        return [
-            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+        return {
+            style: _models_from_docstring(fn)
             for style, fn in _structural_tag_registry.items()
-        ]
+        }
     except Exception as e:
         logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
 
@@ -1827,14 +1830,26 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     try:
         from xgrammar import get_builtin_structural_tag_supported_models
 
-        supported = get_builtin_structural_tag_supported_models()
-        return [
-            {"value": style, "label": style, "models": models}
-            for style, models in supported.items()
-        ]
+        return dict(get_builtin_structural_tag_supported_models())
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)
+        return None
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
+    """
+    registry = _reasoning_parser_registry()
+    if registry is None:
         return []
+    return [
+        {"value": style, "label": style, "models": models}
+        for style, models in registry.items()
+    ]
 
 
 # =============================================================================
@@ -2718,7 +2733,26 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
     if "reasoning_parser" in sent:
-        current_settings.reasoning_parser = request.reasoning_parser or None
+        new_reasoning_parser = request.reasoning_parser or None
+        if new_reasoning_parser is not None:
+            registry = _reasoning_parser_registry()
+            if registry is None:
+                logger.warning(
+                    "Saving reasoning_parser=%r for model %s without validation "
+                    "(xgrammar registry unavailable).",
+                    new_reasoning_parser,
+                    model_id,
+                )
+            elif new_reasoning_parser not in registry:
+                valid = ", ".join(sorted(registry))
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid reasoning_parser '{new_reasoning_parser}'. "
+                        f"Valid options: {valid}"
+                    ),
+                )
+        current_settings.reasoning_parser = new_reasoning_parser
     if "guided_grammar_enabled" in sent:
         current_settings.guided_grammar_enabled = (
             request.guided_grammar_enabled or False

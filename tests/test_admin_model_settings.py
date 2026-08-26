@@ -247,3 +247,105 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+_FAKE_REASONING_PARSER_REGISTRY = {"harmony": ["gpt-oss"], "llama": ["Llama-3"]}
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_unknown_reasoning_parser():
+    pool, entry = _failed_pool()
+
+    with (
+        patch(
+            "omlx.admin.routes._reasoning_parser_registry",
+            return_value=_FAKE_REASONING_PARSER_REGISTRY,
+        ),
+        pytest.raises(admin_routes.HTTPException) as exc_info,
+    ):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(reasoning_parser="qwen"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "harmony" in exc_info.value.detail
+    assert "llama" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_valid_reasoning_parser():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    with patch(
+        "omlx.admin.routes._reasoning_parser_registry",
+        return_value=_FAKE_REASONING_PARSER_REGISTRY,
+    ):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(reasoning_parser="harmony"),
+        )
+
+    assert settings.reasoning_parser == "harmony"
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_clearing_reasoning_parser_skips_validation():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(reasoning_parser="harmony")
+
+    with patch(
+        "omlx.admin.routes._reasoning_parser_registry",
+        return_value=_FAKE_REASONING_PARSER_REGISTRY,
+    ):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(reasoning_parser=""),
+        )
+
+    assert settings.reasoning_parser is None
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_skips_validation_when_registry_unavailable():
+    """xgrammar unavailable: fail open like the dropdown does (returns [])
+    rather than blocking every settings save (#4)."""
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    with patch("omlx.admin.routes._reasoning_parser_registry", return_value=None):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(reasoning_parser="qwen"),
+        )
+
+    assert settings.reasoning_parser == "qwen"
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_logs_when_skipping_validation(caplog):
+    """The fail-open path (registry unavailable) must leave a trace naming
+    the model and the unvalidated value, not just the generic warning
+    already logged inside _reasoning_parser_registry() itself."""
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    with (
+        patch("omlx.admin.routes._reasoning_parser_registry", return_value=None),
+        caplog.at_level("WARNING"),
+    ):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(reasoning_parser="qwen"),
+        )
+
+    assert any(
+        "ling" in record.message and "qwen" in record.message
+        for record in caplog.records
+    )
