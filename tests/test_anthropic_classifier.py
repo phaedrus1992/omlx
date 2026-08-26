@@ -212,6 +212,60 @@ class TestClassifierEnvelopeDrift:
         assert len(classifier_envelope_drift(req)) == 3
 
 
+class TestDetectionIsBestEffort:
+    """A bug in the heuristic must never break an unrelated request.
+
+    The branch sits on the hot path of every /v1/messages call, inside a try
+    whose only handler releases the lease and re-raises. Without isolation a
+    detection bug would 500 requests that aren't even classifier requests.
+    """
+
+    def _apply(self, request, merged=None, forced=None):
+        from omlx.server import _apply_auto_mode_classifier_thinking
+
+        merged = {} if merged is None else merged
+        _apply_auto_mode_classifier_thinking(
+            request, merged, set() if forced is None else forced
+        )
+        return merged
+
+    def test_predicate_raising_does_not_propagate(self, monkeypatch):
+        import omlx.server as server
+
+        def boom(_request):
+            raise RuntimeError("simulated future schema change")
+
+        monkeypatch.setattr(server, "is_auto_mode_classifier_request", boom)
+        merged = self._apply(_request(_classifier_payload()))
+        assert merged == {}, "must fall through, leaving thinking at the default"
+
+    def test_drift_check_raising_does_not_propagate(self, monkeypatch):
+        import omlx.server as server
+
+        def boom(_request):
+            raise RuntimeError("simulated future schema change")
+
+        monkeypatch.setattr(server, "classifier_envelope_drift", boom)
+        merged = self._apply(_request(_classifier_payload()))
+        assert merged["enable_thinking"] is False, (
+            "the fix must still apply — only the diagnostic failed"
+        )
+
+    def test_applies_on_the_captured_envelope(self):
+        merged = self._apply(_request(_classifier_payload()))
+        assert merged["enable_thinking"] is False
+
+    def test_forced_key_still_wins(self):
+        merged = self._apply(
+            _request(_classifier_payload()), forced={"enable_thinking"}
+        )
+        assert "enable_thinking" not in merged
+
+    def test_normal_turn_is_untouched(self):
+        merged = self._apply(_request(_normal_turn_payload(stream=False, tools=[])))
+        assert merged == {}
+
+
 class TestDriftBoundaries:
     """The three drift checks are independent, so cover them independently."""
 
