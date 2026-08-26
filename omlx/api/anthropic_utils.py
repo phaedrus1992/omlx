@@ -728,7 +728,11 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
 
 
 # Claude Code's auto-mode Bash safety classifier identifies itself by this
-# system-prompt opening. Matching on it (rather than on the legacy
+# sentence in its system prompt. The match is a substring test, not a prefix
+# test, on purpose: Claude Code sends the system prompt as several blocks and
+# may reorder or prepend one. A prefix check would then stop matching with no
+# signal at all, which is the silent regression this whole change exists to
+# prevent. Matching on it (rather than on the legacy
 # ``x-anthropic-billing-header:`` marker) is deliberate: that header also
 # appears on ordinary Agent SDK turns, so keying off it would disable thinking
 # on every request. See issue #1.
@@ -777,9 +781,16 @@ def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
     Code's ~35-45 second deadline — the request is then cancelled and the user
     sees "model is temporarily unavailable" (issue #1, and jundot/omlx#2067).
 
+    Auto mode fails closed today: with no verdict the Bash action is refused,
+    not allowed — see the error text quoted in jundot/omlx#2067. So this trades
+    "no verdict, action blocked" for "a verdict reached without extended
+    reasoning". That is an availability fix with a real accuracy cost, and it
+    is why the match is kept narrow. Giving the classifier its own small, fast
+    model is the better long-term answer and is tracked in #2.
+
     Three conditions must all hold:
 
-    1. the system prompt opens with the security-monitor marker,
+    1. the system prompt contains the security-monitor marker anywhere,
     2. the request is not streaming — the classifier never streams,
     3. the request carries no tools — an ordinary conversation turn that merely
        *discusses* the classifier still has Claude Code's tool array attached.
