@@ -757,9 +757,12 @@ def _user_message_text(messages: list[AnthropicMessage] | None) -> str:
             parts.append(content)
             continue
         for block in content or []:
-            text = getattr(block, "text", None)
-            if text is None and isinstance(block, dict):
-                text = block.get("text")
+            # Normalize via the same helper the other extraction sites use, so
+            # this agrees with them on which blocks count as text.
+            block_dict = _content_block_to_dict(block)
+            if block_dict is None or block_dict.get("type") != "text":
+                continue
+            text = block_dict.get("text")
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
