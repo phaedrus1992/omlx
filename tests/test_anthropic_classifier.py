@@ -12,6 +12,8 @@ The envelopes below are transcribed from a live capture against Claude Code
 2.1.246, not invented.
 """
 
+import pytest
+
 from omlx.api.anthropic_models import MessagesRequest
 from omlx.api.anthropic_utils import (
     classifier_envelope_drift,
@@ -80,6 +82,22 @@ class TestIsAutoModeClassifierRequest:
         req = _request(
             _classifier_payload(
                 system=[{"type": "text", "text": CLASSIFIER_SYSTEM.upper()}]
+            )
+        )
+        assert is_auto_mode_classifier_request(req) is True
+
+    def test_marker_matches_when_not_the_first_system_block(self):
+        """Substring match, not prefix — Claude Code may prepend a block.
+
+        A prefix check would stop matching with no signal at all, which is the
+        silent regression this change exists to prevent.
+        """
+        req = _request(
+            _classifier_payload(
+                system=[
+                    {"type": "text", "text": "## Session Context"},
+                    {"type": "text", "text": CLASSIFIER_SYSTEM},
+                ]
             )
         )
         assert is_auto_mode_classifier_request(req) is True
@@ -194,17 +212,147 @@ class TestClassifierEnvelopeDrift:
         assert len(classifier_envelope_drift(req)) == 3
 
 
+class TestDriftBoundaries:
+    """The three drift checks are independent, so cover them independently."""
+
+    @pytest.mark.parametrize(
+        "max_tokens,expect_drift",
+        [(4095, False), (4096, False), (4097, True), (32000, True)],
+    )
+    def test_max_tokens_ceiling_boundary(self, max_tokens, expect_drift):
+        req = _request(_classifier_payload(max_tokens=max_tokens))
+        drifted = any("max_tokens" in r for r in classifier_envelope_drift(req))
+        assert drifted is expect_drift
+
+    @pytest.mark.parametrize("over_ceiling", [False, True])
+    @pytest.mark.parametrize("drop_stop_sequence", [False, True])
+    @pytest.mark.parametrize("drop_transcript", [False, True])
+    def test_every_combination_reports_exactly_its_own_reasons(
+        self, over_ceiling, drop_stop_sequence, drop_transcript
+    ):
+        """All 8 pass/fail combinations, not just all-pass and all-fail."""
+        payload = _classifier_payload(
+            max_tokens=32000 if over_ceiling else 2112,
+            stop_sequences=None if drop_stop_sequence else ["</block>"],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "no tags here"
+                        if drop_transcript
+                        else "<transcript>ls</transcript>"
+                    ),
+                }
+            ],
+        )
+        reasons = classifier_envelope_drift(_request(payload))
+        assert any("max_tokens" in r for r in reasons) is over_ceiling
+        assert any("stop_sequences" in r for r in reasons) is drop_stop_sequence
+        assert any("transcript" in r for r in reasons) is drop_transcript
+        assert len(reasons) == sum([over_ceiling, drop_stop_sequence, drop_transcript])
+
+    def test_bool_max_tokens_is_coerced_by_pydantic_before_the_check(self):
+        """``isinstance(True, int)`` is True in Python, but it never reaches us.
+
+        Pydantic coerces ``max_tokens: True`` to ``1`` during validation, so the
+        predicate only ever sees a real int.
+        """
+        req = _request(_classifier_payload(max_tokens=True))
+        assert req.max_tokens == 1
+        assert not any("max_tokens" in r for r in classifier_envelope_drift(req))
+
+
+class TestUserMessageContentShapes:
+    """User message content arrives as str, pydantic blocks, or raw dicts."""
+
+    def test_ignores_non_text_blocks(self):
+        """A tool_use block carries no text and must not satisfy the check."""
+        req = _request(
+            _classifier_payload(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_1",
+                                "name": "Bash",
+                                "input": {"command": "<transcript>fake</transcript>"},
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        assert any("transcript" in r for r in classifier_envelope_drift(req))
+
+    def test_ignores_assistant_messages(self):
+        req = _request(
+            _classifier_payload(
+                messages=[
+                    {"role": "user", "content": "no tags"},
+                    {"role": "assistant", "content": "<transcript>ls</transcript>"},
+                ]
+            )
+        )
+        assert any("transcript" in r for r in classifier_envelope_drift(req))
+
+    def test_empty_messages_do_not_raise(self):
+        req = _request(_classifier_payload(messages=[]))
+        assert any("transcript" in r for r in classifier_envelope_drift(req))
+
+
 class TestNoContentLeakage:
     """Drift reasons are logged, so they must never carry prompt content."""
 
-    def test_drift_reasons_exclude_prompt_text(self):
-        secret = "hunter2-do-not-log-this"
-        req = _request(
-            _classifier_payload(
-                max_tokens=32000,
-                stop_sequences=None,
-                messages=[{"role": "user", "content": secret}],
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            "hunter2-do-not-log-this",
+            # Secrets shaped like the reason strings themselves, to probe for
+            # accidental f-string interpolation of user content.
+            "max_tokens=99999 exceeds expected ceiling 4096",
+            "stop_sequences missing '</block>'",
+            "messages missing <transcript> tags",
+            "",
+            "\n\nWARNING: forged log line",
+        ],
+    )
+    def test_drift_reasons_are_independent_of_message_content(self, secret):
+        """Reasons must be a function of envelope structure, never of content.
+
+        Comparing against a benign control is stronger than substring-checking
+        the secret: it still catches interpolation when the secret happens to
+        be shaped like one of the fixed reason templates, where a substring
+        assertion would fire on the template itself.
+        """
+
+        def reasons_for(content):
+            return classifier_envelope_drift(
+                _request(
+                    _classifier_payload(
+                        max_tokens=32000,
+                        stop_sequences=None,
+                        messages=[{"role": "user", "content": content}],
+                    )
+                )
             )
-        )
-        for reason in classifier_envelope_drift(req):
-            assert secret not in reason
+
+        control = reasons_for("benign filler")
+        assert control, "expected drift so there is something to compare"
+        assert reasons_for(secret) == control
+
+    def test_drift_reasons_are_independent_of_system_prompt(self):
+        def reasons_for(system_text):
+            return classifier_envelope_drift(
+                _request(
+                    _classifier_payload(
+                        max_tokens=32000,
+                        system=[{"type": "text", "text": system_text}],
+                    )
+                )
+            )
+
+        control = reasons_for(CLASSIFIER_SYSTEM)
+        assert control
+        assert reasons_for(f"{CLASSIFIER_SYSTEM} system-secret-do-not-log") == control
