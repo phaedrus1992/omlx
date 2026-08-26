@@ -629,6 +629,32 @@ class TestCompileGrammarForRequest:
             for record in caplog.records
         )
 
+    @requires_xgrammar
+    def test_invalid_reasoning_parser_preserves_strict_distinction_in_log(
+        self, caplog
+    ):
+        """The InvalidReasoningParserError degrade path must go through the
+        shared _warn_response_format_not_enforced helper so a strict
+        json_schema request still gets the strict-specific wording (#1241),
+        not a bespoke message that drops that distinction."""
+        compiler = MagicMock()
+        engine = _make_engine(grammar_compiler=compiler)
+        strict_rf = {
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": True, "schema": {}},
+        }
+
+        with caplog.at_level("WARNING"):
+            self._call(
+                engine,
+                response_format=strict_rf,
+                reasoning_parser="qwen",
+            )
+        assert any(
+            "strict" in record.message and "qwen" in record.message
+            for record in caplog.records
+        )
+
     def test_compilation_error_returns_none_for_response_format(self):
         """response_format compilation errors → graceful fallback to None."""
         compiler = MagicMock()

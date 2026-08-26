@@ -4425,12 +4425,7 @@ def _compile_grammar_for_request(
     except InvalidReasoningParserError as e:
         if structured_outputs is not None:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        logger.warning(
-            "response_format requested but this model's reasoning_parser is "
-            "misconfigured; output will not be schema-enforced (falling back "
-            "to prompt injection) (%s).",
-            e,
-        )
+        _warn_response_format_not_enforced(response_format, error=e)
     except Exception as e:
         if structured_outputs is not None:
             raise HTTPException(

@@ -325,3 +325,27 @@ async def test_update_model_settings_skips_validation_when_registry_unavailable(
         )
 
     assert settings.reasoning_parser == "qwen"
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_logs_when_skipping_validation(caplog):
+    """The fail-open path (registry unavailable) must leave a trace naming
+    the model and the unvalidated value, not just the generic warning
+    already logged inside _reasoning_parser_registry() itself."""
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    with (
+        patch("omlx.admin.routes._reasoning_parser_registry", return_value=None),
+        caplog.at_level("WARNING"),
+    ):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(reasoning_parser="qwen"),
+        )
+
+    assert any(
+        "ling" in record.message and "qwen" in record.message
+        for record in caplog.records
+    )

@@ -2736,7 +2736,14 @@ async def update_model_settings(
         new_reasoning_parser = request.reasoning_parser or None
         if new_reasoning_parser is not None:
             registry = _reasoning_parser_registry()
-            if registry is not None and new_reasoning_parser not in registry:
+            if registry is None:
+                logger.warning(
+                    "Saving reasoning_parser=%r for model %s without validation "
+                    "(xgrammar registry unavailable).",
+                    new_reasoning_parser,
+                    model_id,
+                )
+            elif new_reasoning_parser not in registry:
                 valid = ", ".join(sorted(registry))
                 raise HTTPException(
                     status_code=400,
