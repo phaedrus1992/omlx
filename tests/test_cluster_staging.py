@@ -282,6 +282,11 @@ def test_cluster_plan_covers_every_layer_across_nodes(tmp_path):
 def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monkeypatch):
     """Configured model directories must not be rewritten to ~/.omlx/models."""
 
+    # A model path under $HOME is the default case (model_dir defaults to
+    # ~/.omlx/models) and the one that exposes the abbreviation bug (#7) — a
+    # path outside $HOME never gets tildified, so it can't catch a regression.
+    # Fix $HOME so this doesn't depend on where the OS happens to put tmp_path.
+    monkeypatch.setenv("HOME", str(tmp_path))
     root = _model(tmp_path / "models with spaces" / "qwen", layers=4, per_file=2)
 
     class A:
@@ -546,6 +551,49 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
     assert copies[0]["source_dir"] == "/Users/peeruser/models/m"
 
 
+def test_source_peer_resolution_sends_the_exact_path_when_under_home(monkeypatch):
+    """A model path under $HOME (the default: model_dir defaults to
+    ~/.omlx/models) must reach remote_model_dir unabbreviated (#7) — it, not
+    the caller, is responsible for re-expressing it in ~-form for the peer."""
+    from omlx.cluster import staging
+    from omlx.cluster.staging import StagingPlan, stage_files_from_source
+
+    monkeypatch.setenv("HOME", "/models")
+
+    plan = StagingPlan(
+        node_id="MacBook",
+        start_layer=6,
+        end_layer=8,
+        required=("tail.safetensors",),
+        missing=("tail.safetensors",),
+        required_bytes=100,
+        missing_bytes=100,
+        total_model_bytes=1000,
+    )
+    monkeypatch.setattr(staging, "remote_file_sizes", lambda _host, _path: {})
+    monkeypatch.setattr(
+        staging, "check_disk_for_staging", lambda *args, **kwargs: 100 * 1024**3
+    )
+    resolved = []
+
+    def fake_remote_model_dir(host, path, **_kwargs):
+        resolved.append((host, path))
+        return path
+
+    monkeypatch.setattr(staging, "remote_model_dir", fake_remote_model_dir)
+
+    stage_files_from_source(
+        plan,
+        model_path="/models/m",
+        source_host="studio",
+        destination_host="macbook",
+        expected_sizes={"tail.safetensors": 100},
+        transfer=lambda **_kwargs: None,
+    )
+
+    assert resolved == [("studio", "/models/m")]
+
+
 def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
     from omlx.cluster import staging
 
@@ -613,11 +661,21 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     from omlx.cluster.planner import ModelLayout
     from omlx.cluster.staging import StagingResult
 
+    # A model under $HOME is the default case and the one that exposes the
+    # tilde-abbreviation bug (#7): the coordinator must send remote_model_dir
+    # the exact absolute path, not a pre-abbreviated ~-form.
+    monkeypatch.setenv("HOME", str(tmp_path))
     root = _model(tmp_path / "source", layers=4, per_file=2)
     app = FastAPI()
     app.include_router(routes.router)
     monkeypatch.setattr(routes, "remote_file_sizes", lambda _host, _path: {})
-    monkeypatch.setattr(routes, "remote_model_dir", lambda _host, path: path)
+    resolved_dirs = []
+
+    def fake_remote_model_dir(_host, path, **_kwargs):
+        resolved_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(routes, "remote_model_dir", fake_remote_model_dir)
     monkeypatch.setattr(
         routes,
         "complete_model_layout",
@@ -702,6 +760,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     assert job["nodes"]["local"]["status"] == "ready"
     assert job["nodes"]["studio"]["status"] == "ready"
     assert job["nodes"]["studio"]["files_completed"] == 1
+    assert resolved_dirs == [str(root)]
 
 
 # ---------------------------------------------------------------------------
