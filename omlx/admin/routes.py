@@ -2164,6 +2164,32 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+def _validate_draft_model_path(
+    value: str, field_name: str, *, check_dflash_compat: bool = False
+) -> None:
+    """Reject an obviously-bad local path for a ``*_draft_model`` field.
+
+    ``value`` is either a local filesystem path or a Hugging Face repo id
+    (``lm_load_compat`` accepts both). Only an absolute path is checked here
+    — a repo id is never absolute, and confirming a repo id exists would
+    require a network round-trip on every settings write.
+    """
+    path = Path(value)
+    if not path.is_absolute():
+        return
+    if not (path / "config.json").exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} '{value}' does not exist or has no config.json.",
+        )
+    if check_dflash_compat:
+        from ..engine.dflash import is_dflash_compatible
+
+        compat_ok, compat_reason = is_dflash_compatible(path)
+        if not compat_ok:
+            raise HTTPException(status_code=400, detail=compat_reason)
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,
@@ -2496,9 +2522,10 @@ async def update_model_settings(
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
     if "specprefill_draft_model" in sent:
-        current_settings.specprefill_draft_model = (
-            request.specprefill_draft_model or None
-        )
+        new_specprefill_draft = request.specprefill_draft_model or None
+        if new_specprefill_draft is not None:
+            _validate_draft_model_path(new_specprefill_draft, "specprefill_draft_model")
+        current_settings.specprefill_draft_model = new_specprefill_draft
     if "specprefill_keep_pct" in sent:
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
@@ -2516,7 +2543,12 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail=compat_reason)
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
-        current_settings.dflash_draft_model = request.dflash_draft_model or None
+        new_dflash_draft = request.dflash_draft_model or None
+        if new_dflash_draft is not None:
+            _validate_draft_model_path(
+                new_dflash_draft, "dflash_draft_model", check_dflash_compat=True
+            )
+        current_settings.dflash_draft_model = new_dflash_draft
     if "dflash_draft_quant_enabled" in sent:
         current_settings.dflash_draft_quant_enabled = (
             bool(request.dflash_draft_quant_enabled)
@@ -2610,12 +2642,17 @@ async def update_model_settings(
             int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
+        new_verify_mode = request.dflash_verify_mode or None
+        valid_verify_modes = ("dflash", "adaptive", "ddtree", "off")
+        if new_verify_mode is not None and new_verify_mode not in valid_verify_modes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid dflash_verify_mode '{new_verify_mode}'. "
+                    f"Valid options: {', '.join(valid_verify_modes)}"
+                ),
+            )
+        current_settings.dflash_verify_mode = new_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -2728,7 +2765,10 @@ async def update_model_settings(
                     )
         current_settings.vlm_mtp_enabled = new_vlm_mtp
     if "vlm_mtp_draft_model" in sent:
-        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
+        new_vlm_mtp_draft = request.vlm_mtp_draft_model or None
+        if new_vlm_mtp_draft is not None:
+            _validate_draft_model_path(new_vlm_mtp_draft, "vlm_mtp_draft_model")
+        current_settings.vlm_mtp_draft_model = new_vlm_mtp_draft
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
