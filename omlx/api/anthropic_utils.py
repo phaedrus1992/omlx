@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 from .anthropic_models import (
@@ -95,6 +96,24 @@ def _content_block_to_dict(block: Any) -> dict[str, Any] | None:
     if isinstance(block, dict):
         return block
     return None
+
+
+def _text_from_content_blocks(blocks: Iterable[Any]) -> list[str]:
+    """Text of every block whose normalized form is a text block, in order.
+
+    Returns raw, unfiltered text. Callers extracting system-prompt text must
+    still apply the billing-header filter and ``_strip_client_budget_markers``
+    themselves — this helper does not know which call site needs them.
+    """
+    texts: list[str] = []
+    for block in blocks:
+        block_dict = _content_block_to_dict(block)
+        if block_dict is None or block_dict.get("type") != "text":
+            continue
+        text = block_dict.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
 
 
 def _append_anthropic_image_part(
@@ -711,18 +730,12 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     if isinstance(system, str):
         return _strip_client_budget_markers(system)
     elif isinstance(system, list):
-        text_parts = []
-        for block in system:
-            if hasattr(block, "text"):
-                text = block.text
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-            else:
-                continue
-            # Skip billing header blocks (contain random values that break prefix cache)
-            if text.startswith(_BILLING_HEADER_PREFIX):
-                continue
-            text_parts.append(text)
+        # Skip billing header blocks (contain random values that break prefix cache)
+        text_parts = [
+            text
+            for text in _text_from_content_blocks(system)
+            if not text.startswith(_BILLING_HEADER_PREFIX)
+        ]
         return _strip_client_budget_markers("\n".join(text_parts))
     return ""
 
@@ -760,15 +773,7 @@ def _user_message_text(messages: list[AnthropicMessage] | None) -> str:
         if isinstance(content, str):
             parts.append(content)
             continue
-        for block in content or []:
-            # Normalize via the same helper the other extraction sites use, so
-            # this agrees with them on which blocks count as text.
-            block_dict = _content_block_to_dict(block)
-            if block_dict is None or block_dict.get("type") != "text":
-                continue
-            text = block_dict.get("text")
-            if isinstance(text, str):
-                parts.append(text)
+        parts.extend(_text_from_content_blocks(content or []))
     return "".join(parts)
 
 
@@ -866,14 +871,7 @@ def _normalize_in_messages_system(
             if content:
                 extracted_parts.append(content)
         elif isinstance(content, list):
-            for block in content:
-                block_dict = _content_block_to_dict(block)
-                if block_dict is None:
-                    continue
-                if block_dict.get("type") == "text":
-                    text = block_dict.get("text", "")
-                    if text:
-                        extracted_parts.append(text)
+            extracted_parts.extend(text for text in _text_from_content_blocks(content) if text)
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:
