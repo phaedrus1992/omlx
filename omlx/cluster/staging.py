@@ -368,12 +368,23 @@ def remote_model_staging_inventory(
     python_executable: str = DEFAULT_REMOTE_PYTHON,
     timeout: float = 600.0,
 ) -> tuple[tuple[ShardInfo, ...], dict[str, int]]:
-    """Read a complete source model's shard map on the Mac that owns it."""
+    """Read a complete source model's shard map on the Mac that owns it.
 
+    A cross-user cluster has a different ``$HOME`` per Mac, so the
+    coordinator's absolute path names nothing on the peer. ``model_path`` is
+    the coordinator's own absolute (or already-portable) path; it is
+    re-expressed in ``~``-form here (#12, matching ``remote_model_dir``'s
+    contract from #7 — callers must not pre-abbreviate it themselves, or a
+    path outside the coordinator's home is sent to the peer unexpanded) and
+    expanded on the peer, so the inventory snippet indexes the model's real
+    location instead of reporting an empty directory.
+    """
+
+    portable = home_relative_model_path(model_path)
     payload = run_remote_python(
         ssh_target,
         _REMOTE_STAGING_INVENTORY_SNIPPET,
-        model_path,
+        portable,
         description="index the model shards",
         python_executable=python_executable,
         timeout=timeout,
@@ -509,12 +520,9 @@ def stage_manifest(
             for name in sidecar_files(source_root)
         }
     else:
-        # Send the ~-form: the peer's inventory snippet expanduser()s it in
-        # its own home, so a cross-user source reports its real shard map
-        # instead of an empty directory at the coordinator's absolute path.
         shards, sidecar_sizes = remote_model_staging_inventory(
             source_host,
-            home_relative_model_path(str(model_path)),
+            str(model_path),
             python_executable=source_python_executable,
         )
     # A peer with a different macOS account has a different $HOME, so the
