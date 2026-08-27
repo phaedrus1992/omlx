@@ -410,3 +410,87 @@ class TestNoContentLeakage:
         control = reasons_for(CLASSIFIER_SYSTEM)
         assert control
         assert reasons_for(f"{CLASSIFIER_SYSTEM} system-secret-do-not-log") == control
+
+
+class TestSteeredClassifierModel:
+    """_steered_classifier_model must fail safe exactly like
+    _apply_auto_mode_classifier_thinking (#2) — a bug in detection or a
+    missing/unset tier model must never propagate, only skip steering."""
+
+    def _call(self, request, server):
+        from omlx.server import _steered_classifier_model
+
+        return _steered_classifier_model(request)
+
+    def _server_state_with(self, monkeypatch, *, steer, tier="haiku", **tier_models):
+        import omlx.server as server
+        from omlx.settings import ClaudeCodeSettings, GlobalSettings
+
+        state = server.ServerState()
+        state.global_settings = GlobalSettings()
+        state.global_settings.claude_code = ClaudeCodeSettings(
+            steer_classifier_requests=steer,
+            classifier_model_tier=tier,
+            **tier_models,
+        )
+        monkeypatch.setattr(server, "_server_state", state)
+        return server
+
+    def test_disabled_by_default_returns_none(self, monkeypatch):
+        server = self._server_state_with(monkeypatch, steer=False, haiku_model="m")
+        result = self._call(_request(_classifier_payload()), server)
+        assert result is None
+
+    def test_enabled_returns_configured_tier_model(self, monkeypatch):
+        server = self._server_state_with(
+            monkeypatch, steer=True, tier="haiku", haiku_model="local-haiku-4bit"
+        )
+        result = self._call(_request(_classifier_payload()), server)
+        assert result == "local-haiku-4bit"
+
+    def test_enabled_but_tier_model_unset_returns_none(self, monkeypatch):
+        server = self._server_state_with(monkeypatch, steer=True, tier="opus")
+        result = self._call(_request(_classifier_payload()), server)
+        assert result is None
+
+    def test_enabled_but_not_a_classifier_request_returns_none(self, monkeypatch):
+        server = self._server_state_with(
+            monkeypatch, steer=True, haiku_model="local-haiku-4bit"
+        )
+        result = self._call(
+            _request(_normal_turn_payload(stream=False, tools=[])), server
+        )
+        assert result is None
+
+    def test_no_global_settings_returns_none(self, monkeypatch):
+        import omlx.server as server
+
+        state = server.ServerState()
+        state.global_settings = None
+        monkeypatch.setattr(server, "_server_state", state)
+        result = self._call(_request(_classifier_payload()), server)
+        assert result is None
+
+    def test_predicate_raising_does_not_propagate(self, monkeypatch):
+        server = self._server_state_with(
+            monkeypatch, steer=True, haiku_model="local-haiku-4bit"
+        )
+
+        def boom(_request):
+            raise RuntimeError("simulated future schema change")
+
+        monkeypatch.setattr(server, "is_auto_mode_classifier_request", boom)
+        result = self._call(_request(_classifier_payload()), server)
+        assert result is None
+
+    def test_sonnet_tier_selects_sonnet_model(self, monkeypatch):
+        server = self._server_state_with(
+            monkeypatch,
+            steer=True,
+            tier="sonnet",
+            haiku_model="h",
+            sonnet_model="s",
+            opus_model="o",
+        )
+        result = self._call(_request(_classifier_payload()), server)
+        assert result == "s"

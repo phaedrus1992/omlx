@@ -5633,6 +5633,42 @@ def _apply_auto_mode_classifier_thinking(
         )
 
 
+def _steered_classifier_model(request) -> str | None:
+    """Model id to serve this request with instead of ``request.model``, or
+    ``None`` to leave the request untouched (#2).
+
+    Off by default (``steer_classifier_requests``). When enabled, a request
+    matching Claude Code's auto-mode Bash safety-classifier predicate (#1) is
+    served with the configured tier's model instead of whatever the active
+    session requested — the classifier's own reply is discarded by Claude
+    Code either way, so which model actually answers it doesn't need to
+    track the chat model.
+
+    Detection sits on the hot path of every ``/v1/messages`` request and
+    must degrade to "don't steer" on any failure, exactly like
+    ``_apply_auto_mode_classifier_thinking`` — steering an unrelated request
+    to a small model on a detection bug is worse than not steering at all.
+    """
+    claude_code = getattr(_server_state.global_settings, "claude_code", None)
+    if claude_code is None or not claude_code.steer_classifier_requests:
+        return None
+
+    try:
+        if not is_auto_mode_classifier_request(request):
+            return None
+    except Exception:
+        logger.warning(
+            "Auto-mode classifier detection failed; not steering this request",
+            exc_info=True,
+        )
+        return None
+
+    tier_model = getattr(
+        claude_code, f"{claude_code.classifier_model_tier}_model", None
+    )
+    return tier_model or None
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
@@ -5672,10 +5708,16 @@ async def create_anthropic_message(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        # Steering must be decided before engine acquisition — it changes
+        # which model gets loaded, not just how the response is shaped (#2).
+        steered_model = _steered_classifier_model(request)
+        engine = await get_engine_for_model(steered_model or request.model, lease=lease)
 
         # Use the exact model selected by the pool, including fallback.
-        resolved_model = _serving_model_id(lease, request.model)
+        # request.model stays what the caller asked for — the response still
+        # echoes it below, matching model_fallback's existing precedent of
+        # never surfacing a server-side substitution to the client.
+        resolved_model = _serving_model_id(lease, steered_model or request.model)
 
         # Get per-model settings
         max_tool_result_tokens = None
