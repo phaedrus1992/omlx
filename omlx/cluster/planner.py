@@ -1160,11 +1160,12 @@ def remote_model_layout(
     coordinator's absolute path names nothing on the peer.
     """
 
+    portable_dir = home_relative_model_path(str(model_dir))
     try:
         payload = run_remote_python(
             ssh_target,
             _REMOTE_LAYOUT_SNIPPET,
-            home_relative_model_path(str(model_dir)),
+            portable_dir,
             description="read the model layout",
             python_executable=python_executable,
             timeout=timeout,
