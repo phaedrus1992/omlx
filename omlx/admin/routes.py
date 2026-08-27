@@ -2170,11 +2170,12 @@ def _validate_draft_model_path(
     """Reject an obviously-bad local path for a ``*_draft_model`` field.
 
     ``value`` is either a local filesystem path or a Hugging Face repo id
-    (``lm_load_compat`` accepts both). Only an absolute path is checked here
-    — a repo id is never absolute, and confirming a repo id exists would
-    require a network round-trip on every settings write.
+    (``lm_load_compat`` accepts both). Only an absolute path (after ``~``
+    expansion) is checked here — a repo id is never absolute, and confirming
+    a repo id exists would require a network round-trip on every settings
+    write.
     """
-    path = Path(value)
+    path = Path(value).expanduser()
     if not path.is_absolute():
         return
     if not (path / "config.json").exists():
@@ -2187,7 +2188,9 @@ def _validate_draft_model_path(
 
         compat_ok, compat_reason = is_dflash_compatible(path)
         if not compat_ok:
-            raise HTTPException(status_code=400, detail=compat_reason)
+            raise HTTPException(
+                status_code=400, detail=f"{field_name} '{value}': {compat_reason}"
+            )
 
 
 @router.put("/api/models/{model_id}/settings")
@@ -2354,7 +2357,18 @@ async def update_model_settings(
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+        new_turboquant_bits = request.turboquant_kv_bits or 4
+        valid_turboquant_bits = (2, 2.5, 3, 3.5, 4, 6, 8)
+        if new_turboquant_bits not in valid_turboquant_bits:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid turboquant_kv_bits '{new_turboquant_bits}'. "
+                    f"Valid options: "
+                    f"{', '.join(str(b) for b in valid_turboquant_bits)}"
+                ),
+            )
+        current_settings.turboquant_kv_bits = new_turboquant_bits
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.
@@ -2581,6 +2595,15 @@ async def update_model_settings(
         current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
     if "dflash_in_memory_cache_max_entries" in sent:
         value = request.dflash_in_memory_cache_max_entries
+        if value is not None and value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid dflash_in_memory_cache_max_entries '{value}'. "
+                    "Must be a positive integer (0 or unset resets to the "
+                    "default of 4)."
+                ),
+            )
         current_settings.dflash_in_memory_cache_max_entries = (
             int(value) if value and value > 0 else 4
         )
