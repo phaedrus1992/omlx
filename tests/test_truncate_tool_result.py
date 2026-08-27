@@ -206,6 +206,19 @@ class TestExtractToolResultContent:
         )
         assert "<truncated " in result
 
+    def test_list_content_with_pydantic_model_blocks(self):
+        """A Pydantic content-block object in the list must not be silently
+        dropped — it should normalize the same way _content_block_to_dict
+        does elsewhere in this module (#22)."""
+        from omlx.api.anthropic_models import ContentBlockText
+
+        content = [
+            ContentBlockText(type="text", text="hello"),
+            {"type": "text", "text": "world"},
+        ]
+        result = _extract_tool_result_content(content)
+        assert result == "hello\nworld"
+
     def test_dict_content_text_type(self):
         """Dict with type=text returns text value."""
         content = {"type": "text", "text": "hello world"}

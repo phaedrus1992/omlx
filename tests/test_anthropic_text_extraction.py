@@ -150,6 +150,13 @@ def test_user_message_text_of_a_single_string_message_is_that_string(text):
     assert _user_message_text(messages) == text
 
 
+_DRIFT_REASON_STATIC_TEXT = (
+    "max_tokens= exceeds expected ceiling 4096"
+    "stop_sequences missing '</block>'"
+    "messages missing <transcript> tags"
+)
+
+
 @given(
     max_tokens=st.integers(min_value=-(2**31), max_value=2**31),
     stop_sequences=st.lists(st.text(), max_size=5),
@@ -159,6 +166,12 @@ def test_classifier_envelope_drift_never_leaks_transcript_content(
     max_tokens, stop_sequences, transcript_secret
 ):
     """Drift reasons name only which field drifted, never message content."""
+    from hypothesis import assume
+
+    # A short generated secret can coincidentally be a substring of the
+    # reasons' own fixed wording (e.g. "b" inside "</block>") with no
+    # relation to actual leakage — exclude that false-positive case.
+    assume(not transcript_secret or transcript_secret not in _DRIFT_REASON_STATIC_TEXT)
     request = MessagesRequest(
         model="test-model",
         max_tokens=max_tokens if max_tokens > 0 else 1,
