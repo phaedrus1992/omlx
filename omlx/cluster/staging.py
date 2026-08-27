@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .ssh_policy import cluster_ssh_options
+from .ssh_policy import cluster_ssh_options, run_ssh_retrying
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
@@ -937,7 +937,6 @@ def stage_files_from_source(
     scp destination address the peer's real directory.
     """
 
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     # model_path is the coordinator's own absolute form. On a remote source
@@ -1091,20 +1090,7 @@ def run_remote_python(
         ssh_target,
         f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
     ]
-    # mDNS resolution for a .local ssh_target is intermittently flaky — one
-    # dropped multicast round trip should not fail a read-only remote query
-    # outright. Every caller here only reads information, so a bounded retry
-    # is always safe.
-    attempts = 3
-    result = None
-    for attempt in range(attempts):
-        result = subprocess.run(
-            argv, capture_output=True, text=True, check=False, timeout=timeout
-        )
-        if result.returncode == 0:
-            break
-        if attempt < attempts - 1:
-            time.sleep(0.5)
+    result = run_ssh_retrying(argv, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(
             f"could not {description} on {ssh_target}: {result.stderr.strip()[:200]}"
@@ -1229,7 +1215,6 @@ def stage_remote_files(
     an empty directory and re-copies everything.
     """
 
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()

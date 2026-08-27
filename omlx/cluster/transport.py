@@ -19,7 +19,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
-from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
+from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options, run_ssh_retrying
 
 # Link speed thresholds for distinguishing TB4 from TB5
 _TB4_MAX_SPEED_GTBS = 40  # TB4 is up to 40 Gb/s
@@ -1222,7 +1222,12 @@ def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
 
 
 def _read(ssh_hostname: str, command: list[str]) -> str:
-    """Run one read-only command on a host, returning "" when it cannot run."""
+    """Run one read-only command on a host, returning "" when it cannot run.
+
+    Retries a bounded few times on failure — see ``run_ssh_retrying`` for why:
+    a single dropped mDNS round trip for a ``.local`` hostname used to be
+    indistinguishable from "this host has no addresses".
+    """
 
     if ssh_hostname not in _LOCAL_HOSTS:
         command = [
@@ -1231,13 +1236,8 @@ def _read(ssh_hostname: str, command: list[str]) -> str:
             ssh_hostname,
             *command,
         ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout
+    result = run_ssh_retrying(command, timeout=30)
+    return result.stdout if result.returncode == 0 else ""
 
 
 def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
