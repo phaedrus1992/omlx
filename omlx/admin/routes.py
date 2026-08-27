@@ -2234,25 +2234,85 @@ _MODEL_SPECIFIC_STR_FIELDS = (
 )
 
 
-def _validate_model_specific_settings_dict(
-    settings: dict[str, Any], *, model_id: str
+def _validate_mtp_compatibility(model_path: str) -> None:
+    """Raise if ``model_path`` cannot support native MTP (mlx-lm PR 990/PR 15).
+
+    Shared between ``update_model_settings`` and the profile create/update
+    handlers (#18) so both write paths enforce the identical config.json and
+    weight-presence checks instead of only one of them catching an
+    MTP-incompatible model.
+    """
+    import json
+    from pathlib import Path
+
+    from ..utils.model_loading import (
+        _checkpoint_has_mtp_weights,
+        _is_mtp_compatible,
+    )
+
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        logger.warning("MTP compatibility check: config.json missing at %s", cfg_path)
+        raise HTTPException(
+            status_code=400,
+            detail="MTP enabled but the model config could not be read; see server logs.",
+        )
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        logger.warning(
+            "MTP compatibility check: failed to read %s", cfg_path, exc_info=True
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="MTP enabled but the model config could not be read; see server logs.",
+        ) from None
+    model_type = cfg.get("model_type")
+    if not _is_mtp_compatible(cfg, model_type):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model is not MTP-compatible (model_type={model_type!r}, "
+                f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
+                "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
+                "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
+                "MTP heads."
+            ),
+        )
+    if not _checkpoint_has_mtp_weights(model_path):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Config declares MTP layers but the weight files contain "
+                "neither mtp.* tensors nor native nextn layers. Re-convert "
+                "from HF with a converter that preserves MTP weights. The "
+                "default mlx-lm sanitize() path strips them."
+            ),
+        )
+
+
+async def _validate_model_specific_settings_dict(
+    settings: dict[str, Any], *, model_id: str, entry, settings_manager
 ) -> None:
     """Validate the subset of ``ModelSettings`` fields present in a raw
     settings dict, using the same rules as ``update_model_settings``.
 
     Shared with the profile create/update handlers so a profile write
     enforces the same checks as the settings endpoint for these fields
-    (#14) — a profile write bypassed them entirely before this, writing
-    them straight from request data instead of going through
-    ``update_model_settings``. Not every field ``update_model_settings``
-    validates has a counterpart here yet — ``dflash_ssd_cache``,
-    ``mtp_enabled``, and ``vlm_mtp_enabled``'s draft-model requirement
-    depend on how a profile's settings will merge with a model's
-    *existing* settings at apply time, which isn't known at write time;
-    ``dflash_enabled``'s compatibility check additionally needs to skip
-    diffusion models the same way ``update_model_settings`` and the
-    apply-time sanitizer do, which create/update don't currently know
-    how to do.
+    (#14, #18) — a profile write bypassed them entirely before this,
+    writing them straight from request data instead of going through
+    ``update_model_settings``.
+
+    ``dflash_ssd_cache`` and ``vlm_mtp_enabled``'s draft-model requirement
+    both depend on a cross-field check against settings the profile itself
+    doesn't set. ``apply_model_profile`` always merges a profile's
+    model-specific fields onto *this same* ``model_id``'s current live
+    settings as an additive overlay (never a different model), so this
+    mirrors ``update_model_settings``'s own merge: a field the profile sets
+    wins, otherwise ``entry``'s current stored setting is used. That merge
+    is necessarily a snapshot at write time — the model's live settings can
+    still change before the profile is applied — the same limitation
+    ``update_model_settings`` already has for its own request-time merge.
 
     A value must arrive as its expected type (unvalidated dict input
     from JSON, unlike ``update_model_settings``'s typed pydantic model) —
@@ -2299,6 +2359,110 @@ def _validate_model_specific_settings_dict(
                         f"Invalid dflash_in_memory_cache_max_entries '{value}'. "
                         "Must be a positive integer (0 or unset resets to the "
                         "default of 4)."
+                    ),
+                )
+
+    def _validated_bool(field_name: str) -> bool | None:
+        """settings[field_name] as bool, or None if absent/null.
+
+        A stringly-typed value (e.g. ``"false"``) is truthy and would
+        otherwise silently enable a field the operator meant to disable.
+        """
+        if field_name not in settings:
+            return None
+        value = settings[field_name]
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a boolean, got {type(value).__name__}.",
+            )
+        return value
+
+    is_diffusion_model = _entry_is_diffusion_model(entry)
+    current_settings = settings_manager.get_settings(model_id)
+
+    if _validated_bool("dflash_enabled") and not is_diffusion_model:
+        from ..engine.dflash import is_dflash_compatible
+
+        compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+        if not compat_ok:
+            raise HTTPException(status_code=400, detail=compat_reason)
+
+    if _validated_bool("dflash_ssd_cache") and not is_diffusion_model:
+        in_mem_value = _validated_bool("dflash_in_memory_cache")
+        in_mem_after = (
+            in_mem_value
+            if in_mem_value is not None
+            else current_settings.dflash_in_memory_cache
+        )
+        if not in_mem_after:
+            raise HTTPException(
+                status_code=400,
+                detail="DFlash SSD cache requires the in-memory cache to be enabled.",
+            )
+        ssd_dir = getattr(
+            getattr(_get_engine_pool(), "_scheduler_config", None),
+            "paged_ssd_cache_dir",
+            None,
+        )
+        if not ssd_dir:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
+                    "(set --paged-ssd-cache-dir or configure it in settings)."
+                ),
+            )
+
+    if _validated_bool("mtp_enabled") and not is_diffusion_model:
+        await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
+        dflash_value = _validated_bool("dflash_enabled")
+        dflash_after = (
+            dflash_value
+            if dflash_value is not None
+            else current_settings.dflash_enabled
+        )
+        if dflash_after:
+            raise HTTPException(
+                status_code=400,
+                detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+            )
+
+    if _validated_bool("vlm_mtp_enabled") and not is_diffusion_model:
+        drafter_after = (
+            settings["vlm_mtp_draft_model"]
+            if "vlm_mtp_draft_model" in settings
+            else current_settings.vlm_mtp_draft_model
+        )
+        if not drafter_after:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "vlm_mtp_enabled requires vlm_mtp_draft_model "
+                    "(path to a gemma4_assistant drafter, "
+                    "e.g. 'gemma-4-26B-A4B-it-assistant')."
+                ),
+            )
+        for other_field, other_label in (
+            ("dflash_enabled", "DFlash"),
+            ("specprefill_enabled", "SpecPrefill"),
+            ("mtp_enabled", "MTP"),
+            ("turboquant_kv_enabled", "TurboQuant KV"),
+        ):
+            other_value = _validated_bool(other_field)
+            other_after = (
+                other_value
+                if other_value is not None
+                else getattr(current_settings, other_field)
+            )
+            if other_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"vlm_mtp_enabled and {other_label} cannot both be "
+                        "enabled; choose one speculative-decoding path."
                     ),
                 )
 
@@ -2789,52 +2953,7 @@ async def update_model_settings(
             # nextn layers). The last check is the one that catches
             # mlx-community converted weights where the default sanitize
             # path stripped the MTP heads.
-            import json
-            from pathlib import Path
-
-            from ..utils.model_loading import (
-                _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
-            )
-
-            cfg_path = Path(entry.model_path) / "config.json"
-            if not cfg_path.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"MTP enabled but config.json missing at {cfg_path}; "
-                        "cannot verify MTP compatibility."
-                    ),
-                )
-            try:
-                cfg = json.loads(cfg_path.read_text())
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MTP enabled but failed to read model config: {e}",
-                )
-            model_type = cfg.get("model_type")
-            if not _is_mtp_compatible(cfg, model_type):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model is not MTP-compatible (model_type={model_type!r}, "
-                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
-                    ),
-                )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Config declares MTP layers but the weight files contain "
-                        "neither mtp.* tensors nor native nextn layers. Re-convert "
-                        "from HF with a converter that preserves MTP weights. The "
-                        "default mlx-lm sanitize() path strips them."
-                    ),
-                )
+            await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
@@ -3170,9 +3289,11 @@ async def create_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
-    _validate_model_specific_settings_dict(request.settings or {}, model_id=model_id)
+    await _validate_model_specific_settings_dict(
+        request.settings or {}, model_id=model_id, entry=entry, settings_manager=mgr
+    )
     try:
         profile = mgr.save_profile(
             model_id=model_id,
@@ -3215,10 +3336,12 @@ async def update_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
     if request.settings is not None:
-        _validate_model_specific_settings_dict(request.settings, model_id=model_id)
+        await _validate_model_specific_settings_dict(
+            request.settings, model_id=model_id, entry=entry, settings_manager=mgr
+        )
     try:
         updated = mgr.update_profile(
             model_id=model_id,
