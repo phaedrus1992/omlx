@@ -910,3 +910,26 @@ def test_remote_model_dir_rejects_an_empty_result(monkeypatch):
         staging.remote_model_dir("studio.local", "/models/m")
 
     assert "/models/m" in str(exc_info.value)
+
+
+def test_remote_model_staging_inventory_sends_the_tilde_form_not_the_absolute_path(
+    monkeypatch,
+):
+    """remote_model_staging_inventory must own the ~-abbreviation for transit
+    itself (#12), matching remote_model_dir's contract (#7) — callers pass
+    the coordinator's exact absolute path and this function converts it
+    internally, instead of requiring every caller to pre-convert."""
+    from omlx.cluster import staging
+
+    monkeypatch.setenv("HOME", "/Users/ranger")
+    captured = {}
+
+    def fake_run_remote_python(ssh_target, snippet, argument, **kwargs):
+        captured["argument"] = argument
+        return {"shards": [], "sidecars": {}}
+
+    monkeypatch.setattr(staging, "run_remote_python", fake_run_remote_python)
+
+    staging.remote_model_staging_inventory("studio.local", "/Users/ranger/models/m")
+
+    assert captured["argument"] == "~/models/m"
