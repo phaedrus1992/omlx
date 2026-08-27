@@ -21,6 +21,7 @@ import secrets
 import shlex
 import struct
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1084,18 +1085,26 @@ def run_remote_python(
         if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
             raise ValueError("remote Python executable must be an absolute path")
         executable_word = shlex.quote(executable)
-    result = subprocess.run(
-        [
-            "ssh",
-            *cluster_ssh_options(connect_timeout=10),
-            ssh_target,
-            f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+    argv = [
+        "ssh",
+        *cluster_ssh_options(connect_timeout=10),
+        ssh_target,
+        f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
+    ]
+    # mDNS resolution for a .local ssh_target is intermittently flaky — one
+    # dropped multicast round trip should not fail a read-only remote query
+    # outright. Every caller here only reads information, so a bounded retry
+    # is always safe.
+    attempts = 3
+    result = None
+    for attempt in range(attempts):
+        result = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=timeout
+        )
+        if result.returncode == 0:
+            break
+        if attempt < attempts - 1:
+            time.sleep(0.5)
     if result.returncode != 0:
         raise RuntimeError(
             f"could not {description} on {ssh_target}: {result.stderr.strip()[:200]}"

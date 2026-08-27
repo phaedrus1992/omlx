@@ -18,6 +18,7 @@ from omlx.cluster.staging import (
     index_shards,
     plan_cluster_staging,
     plan_staging,
+    run_remote_python,
     scp_copy,
     scp_push,
     shards_for_stage,
@@ -782,3 +783,48 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_run_remote_python_retries_a_flaky_mdns_resolution(monkeypatch):
+    """A single dropped mDNS round trip must not fail a read-only remote
+    query outright — every caller here only reads information."""
+
+    monkeypatch.setattr("omlx.cluster.staging.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                argv, 255, "", "ssh: Could not resolve hostname"
+            )
+        return subprocess.CompletedProcess(argv, 0, '{"ok": true}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    payload = run_remote_python(
+        "Studio.local", "print('{}')", "arg", description="read something"
+    )
+
+    assert payload == {"ok": True}
+    assert len(calls) == 2
+
+
+def test_run_remote_python_gives_up_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.staging.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 255, "", "ssh: Could not resolve hostname"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="could not read something"):
+        run_remote_python(
+            "Studio.local", "print('{}')", "arg", description="read something"
+        )
+
+    assert len(calls) == 3
