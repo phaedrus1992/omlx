@@ -421,6 +421,43 @@ def test_remote_staging_pushes_weights_and_sidecars_to_the_named_node(
     assert any(status == "copied" for _name, status, _size in progress)
 
 
+def test_remote_staging_sends_the_tilde_form_when_destination_dir_is_omitted(
+    tmp_path,
+    monkeypatch,
+):
+    """stage_remote_files's destination_dir default must own the
+    ~-abbreviation for transit itself (#16 variant), matching
+    remote_model_dir's contract — a caller that omits destination_dir still
+    reaches the peer's own home instead of sending the coordinator's raw
+    absolute path, which names nothing on a cross-user peer."""
+    from omlx.cluster.staging import stage_remote_files
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = _model(tmp_path / "source", layers=2, per_file=2)
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    seen_paths = []
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+
+    def present_reader(_host, path):
+        seen_paths.append(path)
+        return {}
+
+    stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        sidecars=sidecar_files(root),
+        transfer=lambda **_kwargs: None,
+        present_reader=present_reader,
+    )
+
+    assert seen_paths
+    assert all(path == "~/source" for path in seen_paths)
+
+
 def test_remote_staging_resumes_without_recopying_verified_files(
     tmp_path,
     monkeypatch,

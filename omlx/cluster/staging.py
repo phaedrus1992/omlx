@@ -1228,17 +1228,16 @@ def stage_remote_files(
     number of nodes, and lets the GUI show file-level progress.
 
     ``destination_dir`` is where the files land on the peer. It defaults to the
-    coordinator's own absolute source path, which is only correct when every
-    Mac shares the same $HOME. On a cross-user cluster the caller must pass the
-    directory resolved in the peer's own home, or the present-file probe reads
-    an empty directory and re-copies everything.
+    coordinator's own source path, re-expressed in ``~``-form (matching
+    ``remote_model_dir``'s contract) so a caller who omits it still reaches the
+    peer's own home instead of a path that names nothing there.
     """
 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()
-    destination_dir = destination_dir or str(source)
+    destination_dir = destination_dir or home_relative_model_path(str(source))
     expected = {
         path.name: path.stat().st_size
         for path in source.iterdir()
