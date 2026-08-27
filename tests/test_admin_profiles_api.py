@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for admin profile/template API routes."""
 
+import json
 from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from omlx.admin import routes as admin_routes
 from omlx.model_settings import ModelSettings, ModelSettingsManager
@@ -1421,7 +1424,7 @@ class TestProfileWriteTimeValidation:
             },
         )
         assert r.status_code == 400
-        assert "config.json" in r.text
+        assert "model config could not be read" in r.text
 
     def test_create_rejects_mtp_enabled_when_model_not_mtp_compatible(
         self, client, tmp_path
@@ -1627,3 +1630,89 @@ class TestProfileWriteTimeValidation:
         )
         assert r.status_code == 400
         assert "vlm_mtp_enabled and SpecPrefill" in r.text
+
+    # -- boolean fields must arrive typed, not stringly (#18 security-audit) --
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["dflash_enabled", "dflash_ssd_cache", "mtp_enabled", "vlm_mtp_enabled"],
+    )
+    def test_create_rejects_stringly_typed_boolean_field(self, client, field_name):
+        """A truthy non-bool string (e.g. "false") must not silently enable
+        the field — every other value in this validator is type-checked,
+        this closes the one gap that wasn't."""
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {field_name: "false"},
+            },
+        )
+        assert r.status_code == 400
+        assert field_name in r.text
+        assert "boolean" in r.text
+
+    def test_create_rejects_stringly_typed_dflash_in_memory_cache(self, client):
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._scheduler_config = type(
+            "_Cfg", (), {"paged_ssd_cache_dir": "/tmp/ssd-cache"}
+        )()
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {
+                    "dflash_ssd_cache": True,
+                    "dflash_in_memory_cache": "no",
+                },
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache" in r.text
+        assert "boolean" in r.text
+
+    # -- _validate_mtp_compatibility must never crash on arbitrary config.json
+    #    content (#18 property-test-gap-finder) ------------------------------
+
+    @settings(
+        suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
+    @given(
+        config=st.dictionaries(
+            st.text(min_size=1, max_size=20),
+            st.one_of(
+                st.none(),
+                st.booleans(),
+                st.integers(min_value=-1000, max_value=1000),
+                st.text(max_size=50),
+                st.lists(st.integers(), max_size=5),
+            ),
+            max_size=10,
+        )
+    )
+    def test_mtp_compatibility_check_never_crashes_on_arbitrary_config_json(
+        self, client, tmp_path, config
+    ):
+        import uuid
+
+        c, _ = client
+        unique = uuid.uuid4().hex
+        model_dir = tmp_path / f"model-{unique}"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(config))
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": f"p{unique}",
+                "display_name": "P",
+                "settings": {"mtp_enabled": True},
+            },
+        )
+
+        assert r.status_code in (200, 400)

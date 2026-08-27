@@ -2252,20 +2252,21 @@ def _validate_mtp_compatibility(model_path: str) -> None:
 
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
+        logger.warning("MTP compatibility check: config.json missing at %s", cfg_path)
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"MTP enabled but config.json missing at {cfg_path}; "
-                "cannot verify MTP compatibility."
-            ),
+            detail="MTP enabled but the model config could not be read; see server logs.",
         )
     try:
         cfg = json.loads(cfg_path.read_text())
-    except Exception as e:
+    except Exception:
+        logger.warning(
+            "MTP compatibility check: failed to read %s", cfg_path, exc_info=True
+        )
         raise HTTPException(
             status_code=400,
-            detail=f"MTP enabled but failed to read model config: {e}",
-        )
+            detail="MTP enabled but the model config could not be read; see server logs.",
+        ) from None
     model_type = cfg.get("model_type")
     if not _is_mtp_compatible(cfg, model_type):
         raise HTTPException(
@@ -2290,7 +2291,7 @@ def _validate_mtp_compatibility(model_path: str) -> None:
         )
 
 
-def _validate_model_specific_settings_dict(
+async def _validate_model_specific_settings_dict(
     settings: dict[str, Any], *, model_id: str, entry, settings_manager
 ) -> None:
     """Validate the subset of ``ModelSettings`` fields present in a raw
@@ -2361,20 +2362,39 @@ def _validate_model_specific_settings_dict(
                     ),
                 )
 
+    def _validated_bool(field_name: str) -> bool | None:
+        """settings[field_name] as bool, or None if absent/null.
+
+        A stringly-typed value (e.g. ``"false"``) is truthy and would
+        otherwise silently enable a field the operator meant to disable.
+        """
+        if field_name not in settings:
+            return None
+        value = settings[field_name]
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a boolean, got {type(value).__name__}.",
+            )
+        return value
+
     is_diffusion_model = _entry_is_diffusion_model(entry)
     current_settings = settings_manager.get_settings(model_id)
 
-    if settings.get("dflash_enabled") and not is_diffusion_model:
+    if _validated_bool("dflash_enabled") and not is_diffusion_model:
         from ..engine.dflash import is_dflash_compatible
 
         compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
         if not compat_ok:
             raise HTTPException(status_code=400, detail=compat_reason)
 
-    if settings.get("dflash_ssd_cache") and not is_diffusion_model:
+    if _validated_bool("dflash_ssd_cache") and not is_diffusion_model:
+        in_mem_value = _validated_bool("dflash_in_memory_cache")
         in_mem_after = (
-            bool(settings["dflash_in_memory_cache"])
-            if "dflash_in_memory_cache" in settings
+            in_mem_value
+            if in_mem_value is not None
             else current_settings.dflash_in_memory_cache
         )
         if not in_mem_after:
@@ -2396,11 +2416,12 @@ def _validate_model_specific_settings_dict(
                 ),
             )
 
-    if settings.get("mtp_enabled") and not is_diffusion_model:
-        _validate_mtp_compatibility(entry.model_path)
+    if _validated_bool("mtp_enabled") and not is_diffusion_model:
+        await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
+        dflash_value = _validated_bool("dflash_enabled")
         dflash_after = (
-            bool(settings["dflash_enabled"])
-            if "dflash_enabled" in settings
+            dflash_value
+            if dflash_value is not None
             else current_settings.dflash_enabled
         )
         if dflash_after:
@@ -2409,7 +2430,7 @@ def _validate_model_specific_settings_dict(
                 detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
             )
 
-    if settings.get("vlm_mtp_enabled") and not is_diffusion_model:
+    if _validated_bool("vlm_mtp_enabled") and not is_diffusion_model:
         drafter_after = (
             settings["vlm_mtp_draft_model"]
             if "vlm_mtp_draft_model" in settings
@@ -2430,9 +2451,10 @@ def _validate_model_specific_settings_dict(
             ("mtp_enabled", "MTP"),
             ("turboquant_kv_enabled", "TurboQuant KV"),
         ):
+            other_value = _validated_bool(other_field)
             other_after = (
-                bool(settings[other_field])
-                if other_field in settings
+                other_value
+                if other_value is not None
                 else getattr(current_settings, other_field)
             )
             if other_after:
@@ -2931,7 +2953,7 @@ async def update_model_settings(
             # nextn layers). The last check is the one that catches
             # mlx-community converted weights where the default sanitize
             # path stripped the MTP heads.
-            _validate_mtp_compatibility(entry.model_path)
+            await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
@@ -3269,7 +3291,7 @@ async def create_model_profile(
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
-    _validate_model_specific_settings_dict(
+    await _validate_model_specific_settings_dict(
         request.settings or {}, model_id=model_id, entry=entry, settings_manager=mgr
     )
     try:
@@ -3317,7 +3339,7 @@ async def update_model_profile(
     entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
     if request.settings is not None:
-        _validate_model_specific_settings_dict(
+        await _validate_model_specific_settings_dict(
             request.settings, model_id=model_id, entry=entry, settings_manager=mgr
         )
     try:
