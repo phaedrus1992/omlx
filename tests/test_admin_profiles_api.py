@@ -1012,3 +1012,179 @@ class TestExposeAsModelAPI:
         assert "modal.model_settings.profiles.expose_as_model" in html
         assert "modal.model_settings.profiles.exposed_as" in en
         assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
+
+
+_FAKE_REASONING_PARSER_REGISTRY = {"harmony": ["gpt-oss"], "llama": ["Llama-3"]}
+
+
+class TestProfileWriteTimeValidation:
+    """Profile create/update must enforce the same per-field rules as
+    update_model_settings (#14) — a profile write is a ModelSettings write
+    path too, and previously bypassed every check #9/#10 added."""
+
+    def test_create_rejects_unknown_dflash_verify_mode(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": "bogus"},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+
+    def test_create_accepts_valid_dflash_verify_mode(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": "adaptive"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["dflash_verify_mode"] == "adaptive"
+
+    def test_update_rejects_unknown_dflash_verify_mode(self, client):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={"name": "coding", "display_name": "Coding", "settings": {}},
+        )
+        r = c.put(
+            "/admin/api/models/model-a/profiles/coding",
+            json={"settings": {"dflash_verify_mode": "bogus"}},
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+
+    def test_create_rejects_nonexistent_specprefill_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"specprefill_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "specprefill_draft_model" in r.text
+
+    def test_create_accepts_existing_specprefill_draft_model(self, client, tmp_path):
+        c, _ = client
+        draft_dir = tmp_path / "draft-model"
+        draft_dir.mkdir()
+        (draft_dir / "config.json").write_text("{}")
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"specprefill_draft_model": str(draft_dir)},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_create_rejects_nonexistent_dflash_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_draft_model" in r.text
+
+    def test_create_rejects_nonexistent_vlm_mtp_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"vlm_mtp_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_draft_model" in r.text
+
+    def test_update_rejects_nonexistent_vlm_mtp_draft_model(self, client, tmp_path):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={"name": "coding", "display_name": "Coding", "settings": {}},
+        )
+        missing = tmp_path / "does-not-exist"
+        r = c.put(
+            "/admin/api/models/model-a/profiles/coding",
+            json={"settings": {"vlm_mtp_draft_model": str(missing)}},
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_draft_model" in r.text
+
+    def test_create_rejects_unknown_reasoning_parser(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setattr(
+            admin_routes,
+            "_reasoning_parser_registry",
+            lambda: _FAKE_REASONING_PARSER_REGISTRY,
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "qwen"},
+            },
+        )
+        assert r.status_code == 400
+        assert "harmony" in r.text
+        assert "llama" in r.text
+
+    def test_create_accepts_valid_reasoning_parser(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setattr(
+            admin_routes,
+            "_reasoning_parser_registry",
+            lambda: _FAKE_REASONING_PARSER_REGISTRY,
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "harmony"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["reasoning_parser"] == "harmony"
+
+    def test_create_skips_reasoning_parser_validation_when_registry_unavailable(
+        self, client, monkeypatch
+    ):
+        """Fail open like update_model_settings does when xgrammar is
+        unavailable (#4) — must not block every profile save."""
+        c, _ = client
+        monkeypatch.setattr(
+            admin_routes, "_reasoning_parser_registry", lambda: None
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "qwen"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["reasoning_parser"] == "qwen"

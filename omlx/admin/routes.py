@@ -2193,6 +2193,71 @@ def _validate_draft_model_path(
             )
 
 
+def _validate_dflash_verify_mode(value: str | None) -> None:
+    valid_verify_modes = ("dflash", "adaptive", "ddtree", "off")
+    if value is not None and value not in valid_verify_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid dflash_verify_mode '{value}'. "
+                f"Valid options: {', '.join(valid_verify_modes)}"
+            ),
+        )
+
+
+def _validate_reasoning_parser(value: str | None, *, model_id: str) -> None:
+    if value is None:
+        return
+    registry = _reasoning_parser_registry()
+    if registry is None:
+        logger.warning(
+            "Saving reasoning_parser=%r for model %s without validation "
+            "(xgrammar registry unavailable).",
+            value,
+            model_id,
+        )
+        return
+    if value not in registry:
+        valid = ", ".join(sorted(registry))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid reasoning_parser '{value}'. Valid options: {valid}",
+        )
+
+
+def _validate_model_specific_settings_dict(
+    settings: dict[str, Any], *, model_id: str
+) -> None:
+    """Validate the subset of ``ModelSettings`` fields present in a raw
+    settings dict, using the same rules as ``update_model_settings``.
+
+    Shared with the profile create/update handlers so every ``ModelSettings``
+    write path enforces the same checks (#14) — a profile write bypassed
+    them entirely before this, since it writes the same fields directly
+    from request data instead of going through ``update_model_settings``.
+    """
+    if "dflash_verify_mode" in settings:
+        _validate_dflash_verify_mode(settings["dflash_verify_mode"] or None)
+    if "specprefill_draft_model" in settings:
+        value = settings["specprefill_draft_model"] or None
+        if value is not None:
+            _validate_draft_model_path(value, "specprefill_draft_model")
+    if "dflash_draft_model" in settings:
+        value = settings["dflash_draft_model"] or None
+        if value is not None:
+            _validate_draft_model_path(
+                value, "dflash_draft_model", check_dflash_compat=True
+            )
+    if "vlm_mtp_draft_model" in settings:
+        value = settings["vlm_mtp_draft_model"] or None
+        if value is not None:
+            _validate_draft_model_path(value, "vlm_mtp_draft_model")
+    if "reasoning_parser" in settings:
+        _validate_reasoning_parser(
+            settings["reasoning_parser"] or None, model_id=model_id
+        )
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,
@@ -2666,15 +2731,7 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         new_verify_mode = request.dflash_verify_mode or None
-        valid_verify_modes = ("dflash", "adaptive", "ddtree", "off")
-        if new_verify_mode is not None and new_verify_mode not in valid_verify_modes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Invalid dflash_verify_mode '{new_verify_mode}'. "
-                    f"Valid options: {', '.join(valid_verify_modes)}"
-                ),
-            )
+        _validate_dflash_verify_mode(new_verify_mode)
         current_settings.dflash_verify_mode = new_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
@@ -2797,24 +2854,7 @@ async def update_model_settings(
 
     if "reasoning_parser" in sent:
         new_reasoning_parser = request.reasoning_parser or None
-        if new_reasoning_parser is not None:
-            registry = _reasoning_parser_registry()
-            if registry is None:
-                logger.warning(
-                    "Saving reasoning_parser=%r for model %s without validation "
-                    "(xgrammar registry unavailable).",
-                    new_reasoning_parser,
-                    model_id,
-                )
-            elif new_reasoning_parser not in registry:
-                valid = ", ".join(sorted(registry))
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Invalid reasoning_parser '{new_reasoning_parser}'. "
-                        f"Valid options: {valid}"
-                    ),
-                )
+        _validate_reasoning_parser(new_reasoning_parser, model_id=model_id)
         current_settings.reasoning_parser = new_reasoning_parser
     if "guided_grammar_enabled" in sent:
         current_settings.guided_grammar_enabled = (
@@ -3087,6 +3127,7 @@ async def create_model_profile(
     mgr = _require_settings_manager()
     _require_model(model_id)
     engine_pool = _get_engine_pool()
+    _validate_model_specific_settings_dict(request.settings or {}, model_id=model_id)
     try:
         profile = mgr.save_profile(
             model_id=model_id,
@@ -3131,6 +3172,8 @@ async def update_model_profile(
     mgr = _require_settings_manager()
     _require_model(model_id)
     engine_pool = _get_engine_pool()
+    if request.settings is not None:
+        _validate_model_specific_settings_dict(request.settings, model_id=model_id)
     try:
         updated = mgr.update_profile(
             model_id=model_id,
