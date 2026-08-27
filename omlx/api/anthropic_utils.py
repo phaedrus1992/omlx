@@ -99,7 +99,12 @@ def _content_block_to_dict(block: Any) -> dict[str, Any] | None:
 
 
 def _text_from_content_blocks(blocks: Iterable[Any]) -> list[str]:
-    """Text of every block whose normalized form is a text block, in order."""
+    """Text of every block whose normalized form is a text block, in order.
+
+    Returns raw, unfiltered text. Callers extracting system-prompt text must
+    still apply the billing-header filter and ``_strip_client_budget_markers``
+    themselves — this helper does not know which call site needs them.
+    """
     texts: list[str] = []
     for block in blocks:
         block_dict = _content_block_to_dict(block)
@@ -866,14 +871,7 @@ def _normalize_in_messages_system(
             if content:
                 extracted_parts.append(content)
         elif isinstance(content, list):
-            for block in content:
-                block_dict = _content_block_to_dict(block)
-                if block_dict is None:
-                    continue
-                if block_dict.get("type") == "text":
-                    text = block_dict.get("text", "")
-                    if text:
-                        extracted_parts.append(text)
+            extracted_parts.extend(text for text in _text_from_content_blocks(content) if text)
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:
