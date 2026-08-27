@@ -528,12 +528,8 @@ def convert_anthropic_to_internal_harmony(
             tool_results: list[dict] = []
 
             for block in content:
-                # Handle both Pydantic models and dicts
-                if hasattr(block, "model_dump"):
-                    block_dict = block.model_dump()
-                elif isinstance(block, dict):
-                    block_dict = block
-                else:
+                block_dict = _content_block_to_dict(block)
+                if block_dict is None:
                     continue
 
                 block_type = block_dict.get("type", "")
@@ -956,11 +952,12 @@ def _extract_tool_result_content(
         # List of content blocks
         text_parts = []
         for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 text_parts.append(item)
+                continue
+            item_dict = _content_block_to_dict(item)
+            if item_dict is not None and item_dict.get("type") == "text":
+                text_parts.append(item_dict.get("text", ""))
         result_text = "\n".join(text_parts)
     elif isinstance(content, dict):
         if content.get("type") == "text":
