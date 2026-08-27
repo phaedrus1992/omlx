@@ -349,3 +349,345 @@ async def test_update_model_settings_logs_when_skipping_validation(caplog):
         "ling" in record.message and "qwen" in record.message
         for record in caplog.records
     )
+
+
+# --- dflash_verify_mode: reject invalid values instead of reverting to None (#10) ---
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_unknown_dflash_verify_mode():
+    pool, entry = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(dflash_verify_mode="bogus"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "dflash" in exc_info.value.detail
+    assert "adaptive" in exc_info.value.detail
+    assert "ddtree" in exc_info.value.detail
+    assert "off" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_valid_dflash_verify_mode():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(dflash_verify_mode="adaptive"),
+    )
+
+    assert settings.dflash_verify_mode == "adaptive"
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_clearing_dflash_verify_mode_skips_validation():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(dflash_verify_mode="adaptive")
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(dflash_verify_mode=""),
+    )
+
+    assert settings.dflash_verify_mode is None
+
+
+# --- *_draft_model fields: validate existence at write time (#10) ---
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_nonexistent_specprefill_draft_model(
+    tmp_path,
+):
+    pool, entry = _failed_pool()
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(specprefill_draft_model=str(missing)),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_existing_specprefill_draft_model(
+    tmp_path,
+):
+    pool, entry = _failed_pool()
+    draft_dir = tmp_path / "draft-model"
+    draft_dir.mkdir()
+    (draft_dir / "config.json").write_text("{}")
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(specprefill_draft_model=str(draft_dir)),
+    )
+
+    assert settings.specprefill_draft_model == str(draft_dir)
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_repo_id_specprefill_draft_model():
+    """A repo id (not an absolute path) is passed through unchecked --
+    verifying it exists would require a network round-trip on every
+    settings write."""
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            specprefill_draft_model="mlx-community/some-draft-4bit"
+        ),
+    )
+
+    assert settings.specprefill_draft_model == "mlx-community/some-draft-4bit"
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_nonexistent_dflash_draft_model(tmp_path):
+    pool, entry = _failed_pool()
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(dflash_draft_model=str(missing)),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_dflash_incompatible_draft_model(
+    tmp_path,
+):
+    pool, entry = _failed_pool()
+    draft_dir = tmp_path / "draft-model"
+    draft_dir.mkdir()
+    (draft_dir / "config.json").write_text("{}")
+
+    with (
+        patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(False, "not a supported model_type"),
+        ),
+        pytest.raises(admin_routes.HTTPException, match="not a supported model_type"),
+    ):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(dflash_draft_model=str(draft_dir)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_dflash_compatible_draft_model(tmp_path):
+    pool, entry = _failed_pool()
+    draft_dir = tmp_path / "draft-model"
+    draft_dir.mkdir()
+    (draft_dir / "config.json").write_text("{}")
+    settings = ModelSettings()
+
+    with patch(
+        "omlx.engine.dflash.is_dflash_compatible",
+        return_value=(True, ""),
+    ):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(dflash_draft_model=str(draft_dir)),
+        )
+
+    assert settings.dflash_draft_model == str(draft_dir)
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_nonexistent_vlm_mtp_draft_model(
+    tmp_path,
+):
+    """Validated even when vlm_mtp_enabled is absent from the same payload --
+    the gap #10 reported (existing mutex/requires check only fires when
+    vlm_mtp_enabled is set in the same request)."""
+    pool, entry = _failed_pool()
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(vlm_mtp_draft_model=str(missing)),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_existing_vlm_mtp_draft_model(tmp_path):
+    pool, entry = _failed_pool()
+    draft_dir = tmp_path / "draft-model"
+    draft_dir.mkdir()
+    (draft_dir / "config.json").write_text("{}")
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(vlm_mtp_draft_model=str(draft_dir)),
+    )
+
+    assert settings.vlm_mtp_draft_model == str(draft_dir)
+
+
+# --- variant bugs found by pre-pr-review's variant-bug-hunter on #10's diff:
+# same silent-coercion pattern as dflash_verify_mode, in the same function. ---
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_unknown_turboquant_kv_bits():
+    pool, entry = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(turboquant_kv_bits=5),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_valid_turboquant_kv_bits():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(turboquant_kv_bits=2.5),
+    )
+
+    assert settings.turboquant_kv_bits == 2.5
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_clearing_turboquant_kv_bits_resets_to_default():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(turboquant_kv_bits=8)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(turboquant_kv_bits=0),
+    )
+
+    assert settings.turboquant_kv_bits == 4
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_negative_dflash_in_memory_cache_max_entries():
+    pool, entry = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(dflash_in_memory_cache_max_entries=-3),
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_valid_dflash_in_memory_cache_max_entries():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(dflash_in_memory_cache_max_entries=16),
+    )
+
+    assert settings.dflash_in_memory_cache_max_entries == 16
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_clearing_dflash_in_memory_cache_max_entries_resets_to_default():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(dflash_in_memory_cache_max_entries=16)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(dflash_in_memory_cache_max_entries=0),
+    )
+
+    assert settings.dflash_in_memory_cache_max_entries == 4
+
+
+# --- P2 fixes from pre-pr-review analyzers on #10's diff ---
+
+
+@pytest.mark.asyncio
+async def test_dflash_incompatible_draft_model_error_names_the_field(tmp_path):
+    """security-audit + silent-failure-hunter: the compat-rejection detail
+    didn't say which field it was about, unlike the does-not-exist branch
+    three lines above it."""
+    pool, entry = _failed_pool()
+    draft_dir = tmp_path / "draft-model"
+    draft_dir.mkdir()
+    (draft_dir / "config.json").write_text("{}")
+
+    with (
+        patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(False, "not a supported model_type"),
+        ),
+        pytest.raises(admin_routes.HTTPException) as exc_info,
+    ):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(dflash_draft_model=str(draft_dir)),
+        )
+
+    assert "dflash_draft_model" in exc_info.value.detail
+    assert "not a supported model_type" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_expands_tilde_in_draft_model_path(
+    tmp_path, monkeypatch
+):
+    """security-audit: a tilde-form local path (~/models/foo) looks like a
+    local path but is not Path.is_absolute() -- must be expanded before the
+    existence check, or it silently skips validation like a repo id would."""
+    pool, entry = _failed_pool()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    missing = "~/does-not-exist"
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(specprefill_draft_model=missing),
+        )
+
+    assert exc_info.value.status_code == 400
