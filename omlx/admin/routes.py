@@ -2225,37 +2225,82 @@ def _validate_reasoning_parser(value: str | None, *, model_id: str) -> None:
         )
 
 
+_MODEL_SPECIFIC_STR_FIELDS = (
+    "dflash_verify_mode",
+    "specprefill_draft_model",
+    "dflash_draft_model",
+    "vlm_mtp_draft_model",
+    "reasoning_parser",
+)
+
+
 def _validate_model_specific_settings_dict(
     settings: dict[str, Any], *, model_id: str
 ) -> None:
     """Validate the subset of ``ModelSettings`` fields present in a raw
     settings dict, using the same rules as ``update_model_settings``.
 
-    Shared with the profile create/update handlers so every ``ModelSettings``
-    write path enforces the same checks (#14) — a profile write bypassed
-    them entirely before this, since it writes the same fields directly
-    from request data instead of going through ``update_model_settings``.
+    Shared with the profile create/update handlers so a profile write
+    enforces the same checks as the settings endpoint for these fields
+    (#14) — a profile write bypassed them entirely before this, writing
+    them straight from request data instead of going through
+    ``update_model_settings``. Not every field ``update_model_settings``
+    validates has a counterpart here yet — ``dflash_ssd_cache``,
+    ``mtp_enabled``, and ``vlm_mtp_enabled``'s draft-model requirement
+    depend on how a profile's settings will merge with a model's
+    *existing* settings at apply time, which isn't known at write time;
+    ``dflash_enabled``'s compatibility check additionally needs to skip
+    diffusion models the same way ``update_model_settings`` and the
+    apply-time sanitizer do, which create/update don't currently know
+    how to do.
+
+    A value must arrive as its expected type (unvalidated dict input
+    from JSON, unlike ``update_model_settings``'s typed pydantic model) —
+    a falsy non-string/non-number (``0``, ``False``, ``[]``) must not
+    silently bypass validation via a truthiness check and then still get
+    persisted by ``filter_profile_fields``, which only treats ``None``
+    and ``""`` as unset.
     """
-    if "dflash_verify_mode" in settings:
-        _validate_dflash_verify_mode(settings["dflash_verify_mode"] or None)
-    if "specprefill_draft_model" in settings:
-        value = settings["specprefill_draft_model"] or None
-        if value is not None:
-            _validate_draft_model_path(value, "specprefill_draft_model")
-    if "dflash_draft_model" in settings:
-        value = settings["dflash_draft_model"] or None
-        if value is not None:
-            _validate_draft_model_path(
-                value, "dflash_draft_model", check_dflash_compat=True
+    for field_name in _MODEL_SPECIFIC_STR_FIELDS:
+        if field_name not in settings:
+            continue
+        value = settings[field_name]
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a string, got {type(value).__name__}.",
             )
-    if "vlm_mtp_draft_model" in settings:
-        value = settings["vlm_mtp_draft_model"] or None
-        if value is not None:
-            _validate_draft_model_path(value, "vlm_mtp_draft_model")
-    if "reasoning_parser" in settings:
-        _validate_reasoning_parser(
-            settings["reasoning_parser"] or None, model_id=model_id
-        )
+        if field_name == "dflash_verify_mode":
+            _validate_dflash_verify_mode(value)
+        elif field_name == "reasoning_parser":
+            _validate_reasoning_parser(value, model_id=model_id)
+        elif field_name == "dflash_draft_model":
+            _validate_draft_model_path(value, field_name, check_dflash_compat=True)
+        else:
+            _validate_draft_model_path(value, field_name)
+
+    if "dflash_in_memory_cache_max_entries" in settings:
+        value = settings["dflash_in_memory_cache_max_entries"]
+        if value is not None and value != "":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "dflash_in_memory_cache_max_entries must be a number, "
+                        f"got {type(value).__name__}."
+                    ),
+                )
+            if value < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid dflash_in_memory_cache_max_entries '{value}'. "
+                        "Must be a positive integer (0 or unset resets to the "
+                        "default of 4)."
+                    ),
+                )
 
 
 @router.put("/api/models/{model_id}/settings")

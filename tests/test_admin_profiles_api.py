@@ -1188,3 +1188,74 @@ class TestProfileWriteTimeValidation:
         )
         assert r.status_code == 200, r.text
         assert r.json()["profile"]["settings"]["reasoning_parser"] == "qwen"
+
+    def test_create_rejects_non_string_dflash_verify_mode(self, client):
+        """A falsy non-string (0, False, []) must not silently skip
+        validation via the `value or None` idiom and then get persisted
+        by filter_profile_fields, which only treats None/"" as unset."""
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": 0},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+        assert "string" in r.text
+
+    def test_create_rejects_non_string_reasoning_parser(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": False},
+            },
+        )
+        assert r.status_code == 400
+        assert "reasoning_parser" in r.text
+        assert "string" in r.text
+
+    def test_create_rejects_negative_dflash_in_memory_cache_max_entries(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": -1},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache_max_entries" in r.text
+
+    def test_create_rejects_non_numeric_dflash_in_memory_cache_max_entries(
+        self, client
+    ):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": "lots"},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache_max_entries" in r.text
+
+    def test_create_accepts_valid_dflash_in_memory_cache_max_entries(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": 8},
+            },
+        )
+        assert r.status_code == 200, r.text
