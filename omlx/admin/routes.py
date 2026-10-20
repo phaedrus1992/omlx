@@ -82,6 +82,7 @@ from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
+    SPLASH_STATE_FORMATS,
     SubKeyEntry,
     burst_decode_env,
 )
@@ -778,6 +779,8 @@ class GlobalSettingsRequest(BaseModel):
     # External engines: Splash. An empty path means automatic detection.
     splash_path: str | None = None
     splash_kv_format: str | None = None
+    splash_state_format: str | None = None
+    splash_decode_share: float | None = None
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
@@ -4727,6 +4730,8 @@ def _global_settings_response(global_settings):
             "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
             "splash_path": global_settings.integrations.splash_path,
             "splash_kv_format": global_settings.integrations.splash_kv_format,
+            "splash_state_format": global_settings.integrations.splash_state_format,
+            "splash_decode_share": global_settings.integrations.splash_decode_share,
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -5631,6 +5636,22 @@ async def update_global_settings(
                 detail=f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}",
             )
         global_settings.integrations.splash_kv_format = request.splash_kv_format
+        integrations_changed = True
+    if "splash_state_format" in request.model_fields_set:
+        if request.splash_state_format not in SPLASH_STATE_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"splash_state_format must be one of {sorted(SPLASH_STATE_FORMATS)}",
+            )
+        global_settings.integrations.splash_state_format = request.splash_state_format
+        integrations_changed = True
+    if "splash_decode_share" in request.model_fields_set:
+        share = request.splash_decode_share
+        if share is not None and not 0 <= share < float("inf"):
+            raise HTTPException(
+                status_code=400, detail="splash_decode_share must be >= 0"
+            )
+        global_settings.integrations.splash_decode_share = share
         integrations_changed = True
     if "splash_max_memory_gb" in request.model_fields_set:
         memory = request.splash_max_memory_gb

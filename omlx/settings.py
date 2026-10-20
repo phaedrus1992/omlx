@@ -551,6 +551,7 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 
 # KV cache storage formats `splash serve --kv-format` accepts.
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
+SPLASH_STATE_FORMATS = frozenset({"fp32", "bf16"})
 
 
 @dataclass
@@ -971,6 +972,11 @@ class IntegrationSettings:
     # oMLX looks for an installed launcher itself.
     splash_path: str | None = None
     splash_kv_format: str = "int8"  # "int8" | "bf16"
+    # Recurrent-state storage: "bf16" halves each saved state (Splash 1.3.2+).
+    splash_state_format: str = "fp32"  # "fp32" | "bf16"
+    # Decode time owed per unit of prefill time while other requests decode;
+    # None leaves Splash's own default.
+    splash_decode_share: float | None = None
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
@@ -1002,6 +1008,8 @@ class IntegrationSettings:
             "web_search_content_max_chars": self.web_search_content_max_chars,
             "splash_path": self.splash_path,
             "splash_kv_format": self.splash_kv_format,
+            "splash_state_format": self.splash_state_format,
+            "splash_decode_share": self.splash_decode_share,
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
@@ -1043,6 +1051,8 @@ class IntegrationSettings:
             ),
             splash_path=data.get("splash_path") or None,
             splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_state_format=data.get("splash_state_format", "fp32"),
+            splash_decode_share=data.get("splash_decode_share"),
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
@@ -1882,6 +1892,17 @@ class GlobalSettings:
             errors.append(
                 f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
             )
+        if self.integrations.splash_state_format not in SPLASH_STATE_FORMATS:
+            errors.append(
+                f"splash_state_format must be one of {sorted(SPLASH_STATE_FORMATS)}"
+            )
+        share = self.integrations.splash_decode_share
+        if share is not None and (
+            isinstance(share, bool)
+            or not isinstance(share, (int, float))
+            or not 0 <= share < float("inf")
+        ):
+            errors.append("splash_decode_share must be a number >= 0")
         memory = self.integrations.splash_max_memory_gb
         if memory is not None and memory <= 0:
             errors.append("splash_max_memory_gb must be > 0")

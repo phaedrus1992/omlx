@@ -545,6 +545,37 @@ class TestRequestTranslation:
         assert value("--max-cache-disk") == str(5 * GIB)
         assert value("--cache-dir") == str(tmp_path / "ssd")
 
+    def test_serve_command_passes_state_format_and_decode_share(self, tmp_path):
+        command = _engine(
+            tmp_path, version="1.3.2", state_format="bf16", decode_share=1.5
+        )._serve_command(9000)
+
+        assert command[command.index("--state-format") + 1] == "bf16"
+        assert command[command.index("--decode-share") + 1] == "1.5"
+
+    def test_serve_command_leaves_state_format_and_decode_share_to_splash(
+        self, tmp_path
+    ):
+        command = _engine(tmp_path, version="1.3.2")._serve_command(9000)
+
+        assert "--state-format" not in command
+        assert "--decode-share" not in command
+
+    def test_serve_command_keeps_decode_share_zero(self, tmp_path):
+        command = _engine(tmp_path, decode_share=0.0)._serve_command(9000)
+
+        assert command[command.index("--decode-share") + 1] == "0.0"
+
+    def test_splash_before_1_3_2_gets_no_state_format(self, tmp_path, caplog):
+        # --state-format arrived in Splash 1.3.2; older launchers reject it.
+        with caplog.at_level("WARNING", logger="omlx.engine.splash"):
+            command = _engine(
+                tmp_path, version="1.3.1", state_format="bf16"
+            )._serve_command(9000)
+
+        assert "--state-format" not in command
+        assert any("--state-format" in r.getMessage() for r in caplog.records)
+
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)
 
@@ -1224,6 +1255,8 @@ class TestAdminAPI:
             splash_max_memory_gb=24,
             splash_ssd_cache_gb=0,
             splash_ane_prefill=False,
+            splash_state_format="bf16",
+            splash_decode_share=1.5,
         )
 
         assert "integrations" in result["runtime_applied"]
@@ -1233,7 +1266,16 @@ class TestAdminAPI:
             24,
         )
         assert (restored.splash_ssd_cache_gb, restored.splash_ane_prefill) == (0, False)
+        assert (restored.splash_state_format, restored.splash_decode_share) == (
+            "bf16",
+            1.5,
+        )
+        await _post_global(settings, splash_decode_share=None)
+        assert settings.integrations.splash_decode_share is None
         for fields in (
+            {"splash_state_format": "fp16"},
+            {"splash_decode_share": -0.5},
+            {"splash_decode_share": float("inf")},
             {"splash_kv_format": "fp8"},
             {"splash_max_memory_gb": 0},
             {"splash_ssd_cache_gb": -1},

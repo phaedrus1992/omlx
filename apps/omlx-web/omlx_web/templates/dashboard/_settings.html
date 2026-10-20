@@ -1394,6 +1394,29 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.state_format') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.state_format_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.splash_state_format"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="fp32">fp32</option>
+                                        <option value="bf16">bf16</option>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.decode_share') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.decode_share_hint') }}</p>
+                                    </div>
+                                    <input type="number" min="0" step="0.1"
+                                           :value="globalSettings.integrations.splash_decode_share ?? ''"
+                                           @change="saveSplashSize('splash_decode_share', $event.target, 0)"
+                                           placeholder="{{ t('settings.integrations.splash.auto') }}"
+                                           class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_memory') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_memory_hint') }}</p>
                                     </div>
