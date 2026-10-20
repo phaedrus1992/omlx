@@ -11,7 +11,11 @@ generative (hypothesis) tests (#5).
 from hypothesis import given
 from hypothesis import strategies as st
 
-from omlx.api.anthropic_models import ContentBlockText, ContentBlockToolUse, SystemContent
+from omlx.api.anthropic_models import (
+    ContentBlockText,
+    ContentBlockToolUse,
+    SystemContent,
+)
 from omlx.api.anthropic_utils import _extract_system_text, _text_from_content_blocks
 
 # ---------------------------------------------------------------------------

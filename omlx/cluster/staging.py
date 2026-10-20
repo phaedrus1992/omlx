@@ -14,6 +14,7 @@ copy to each Mac" and "clustering needs the shards you don't already have".
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -24,10 +25,13 @@ import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from ..model_discovery import _VISION_WEIGHT_PREFIXES
 from .ssh_policy import cluster_ssh_options, run_ssh_retrying
+from .worker_shim import CLUSTER_PYTHON_SHIM
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
@@ -65,9 +69,9 @@ def _is_auxiliary_shard(filename: str) -> bool:
     return len(Path(filename).parts) > 1
 
 
-# Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
-# command line so the peer's shell expands ``~`` to its own home.
-DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
+# Every running oMLX installation publishes this interpreter shim. Keep the
+# peer-home form so the remote shell expands it for the authenticated user.
+DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
 
 
 def is_local_host(host: str) -> bool:
@@ -134,6 +138,26 @@ def _safetensors_tensor_names(path: Path) -> list[str]:
     return [name for name in header if name != "__metadata__"]
 
 
+def _shard_coverage(names: Sequence[str]) -> tuple[frozenset[int], bool]:
+    """Decoder layers a file holds, and whether it holds shared text tensors.
+
+    Vision tensors are ignored: ranks load the text model only, and
+    ``vision_tower.blocks.N`` is not decoder layer N.
+    """
+
+    layers: set[int] = set()
+    shared = False
+    for name in names:
+        if name.startswith(_VISION_WEIGHT_PREFIXES):
+            continue
+        match = _LAYER.search(name)
+        if match:
+            layers.add(int(match.group(1)))
+        else:
+            shared = True
+    return frozenset(layers), shared
+
+
 def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
     """Describe every weight file in a model directory.
 
@@ -186,19 +210,12 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
                 )
             )
             continue
-        layers = set()
-        shared = False
-        for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
-            else:
-                shared = True
+        layers, shared = _shard_coverage(names)
         shards.append(
             ShardInfo(
                 name=rel_name,
                 size_bytes=path.stat().st_size,
-                layers=frozenset(layers),
+                layers=layers,
                 has_shared_tensors=shared,
             )
         )
@@ -219,9 +236,7 @@ def shards_for_stage(
 
     wanted = set(range(start_layer, end_layer))
     return tuple(
-        shard
-        for shard in shards
-        if (shard.layers & wanted) or shard.has_shared_tensors
+        shard for shard in shards if (shard.layers & wanted) or shard.has_shared_tensors
     )
 
 
@@ -269,6 +284,11 @@ def _model_identity_digest(model_path: str | Path) -> str:
     return hasher.hexdigest()
 
 
+# Public name for the digest; the manifest endpoint and peer comparison in
+# ``modelsync.py`` share this exact identity definition with staging.
+model_identity_digest = _model_identity_digest
+
+
 def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     """Read the full shard map from the index even on a partially staged rank."""
 
@@ -308,19 +328,12 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
                 )
             )
             continue
-        layers: set[int] = set()
-        shared = False
-        for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
-            else:
-                shared = True
+        layers, shared = _shard_coverage(names)
         shards.append(
             ShardInfo(
                 name=filename,
                 size_bytes=path.stat().st_size if path.is_file() else 0,
-                layers=frozenset(layers),
+                layers=layers,
                 has_shared_tensors=shared,
             )
         )
@@ -381,7 +394,9 @@ def validate_staged_model(
     indexed = _indexed_shards(root)
     shards = indexed if indexed is not None else index_shards(root)
     required = shards_for_stage(shards, start_layer, end_layer)
-    missing = tuple(shard.name for shard in required if not (root / shard.name).is_file())
+    missing = tuple(
+        shard.name for shard in required if not (root / shard.name).is_file()
+    )
     corrupt: list[str] = []
     for shard in required:
         path = root / shard.name
@@ -421,10 +436,7 @@ def model_staging_inventory(model_path: str | Path) -> dict[str, Any]:
             }
             for shard in shards
         ],
-        "sidecars": {
-            name: (root / name).stat().st_size
-            for name in sidecars
-        },
+        "sidecars": {name: (root / name).stat().st_size for name in sidecars},
     }
 
 
@@ -442,23 +454,12 @@ def remote_model_staging_inventory(
     python_executable: str = DEFAULT_REMOTE_PYTHON,
     timeout: float = 600.0,
 ) -> tuple[tuple[ShardInfo, ...], dict[str, int]]:
-    """Read a complete source model's shard map on the Mac that owns it.
+    """Read a complete source model's shard map on the Mac that owns it."""
 
-    A cross-user cluster has a different ``$HOME`` per Mac, so the
-    coordinator's absolute path names nothing on the peer. ``model_path`` is
-    the coordinator's own absolute (or already-portable) path; it is
-    re-expressed in ``~``-form here (#12, matching ``remote_model_dir``'s
-    contract from #7 — callers must not pre-abbreviate it themselves, or a
-    path outside the coordinator's home is sent to the peer unexpanded) and
-    expanded on the peer, so the inventory snippet indexes the model's real
-    location instead of reporting an empty directory.
-    """
-
-    portable = home_relative_model_path(model_path)
     payload = run_remote_python(
         ssh_target,
         _REMOTE_STAGING_INVENTORY_SNIPPET,
-        portable,
+        model_path,
         description="index the model shards",
         python_executable=python_executable,
         timeout=timeout,
@@ -574,6 +575,7 @@ def stage_manifest(
     *,
     source_host: str = "127.0.0.1",
     source_python_executable: str = DEFAULT_REMOTE_PYTHON,
+    path_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -598,30 +600,39 @@ def stage_manifest(
             for name in sidecar_files(source_root)
         }
     else:
+        # Send the ~-form: the peer's inventory snippet expanduser()s it in
+        # its own home, so a cross-user source reports its real shard map
+        # instead of an empty directory at the coordinator's absolute path.
         shards, sidecar_sizes = remote_model_staging_inventory(
             source_host,
-            str(model_path),
+            home_relative_model_path(str(model_path)),
             python_executable=source_python_executable,
         )
     # A peer with a different macOS account has a different $HOME, so the
-    # coordinator-absolute path names nothing there. remote_model_dir resolves
-    # it per-node (re-expressing it in ~-form for transit, then expanding on
-    # the peer — #7), so readiness must probe each peer in its OWN home too —
-    # otherwise an already-present model reads as entirely missing and a full
-    # re-copy is (needlessly, and here fatally) proposed.
+    # coordinator-absolute path names nothing there. The worker now receives the
+    # ~-form and resolves it per-node (see home_relative_model_path / launch),
+    # so readiness must probe each peer in its OWN home too — otherwise an
+    # already-present model reads as entirely missing and a full re-copy is
+    # (needlessly, and here fatally) proposed.
+    portable = home_relative_model_path(str(model_path))
     present_by_node = {}
     for assignment in assignments:
         ssh_target = hosts_by_node.get(assignment.node_id)
         if not ssh_target:
             continue
         if is_local_host(ssh_target):
+            destination = Path(
+                (path_map or {}).get(assignment.node_id, remote_dir)
+            ).expanduser()
             present_by_node[assignment.node_id] = {
                 path.name: path.stat().st_size
-                for path in Path(remote_dir).iterdir()
+                for path in (destination.iterdir() if destination.is_dir() else ())
                 if path.is_file()
             }
         else:
-            peer_dir = remote_model_dir(ssh_target, remote_dir)
+            peer_dir = remote_model_dir(
+                ssh_target, (path_map or {}).get(assignment.node_id, portable)
+            )
             present_by_node[assignment.node_id] = remote_file_sizes(
                 ssh_target, peer_dir
             )
@@ -651,9 +662,7 @@ def stage_manifest(
     for plan in plans:
         present = present_by_node.get(plan.node_id, {})
         missing_sidecars = tuple(
-            name
-            for name, size in sidecar_sizes.items()
-            if present.get(name) != size
+            name for name, size in sidecar_sizes.items() if present.get(name) != size
         )
         missing_sidecar_bytes = sum(sidecar_sizes[name] for name in missing_sidecars)
         total_missing_bytes += plan.missing_bytes + missing_sidecar_bytes
@@ -668,9 +677,7 @@ def stage_manifest(
         )
     return {
         "sidecars": list(sidecars),
-        "source_host": (
-            "127.0.0.1" if source_is_local else source_host
-        ),
+        "source_host": ("127.0.0.1" if source_is_local else source_host),
         "nodes": nodes,
         "total_missing_bytes": total_missing_bytes,
         "ready": all(node["ready"] for node in nodes),
@@ -697,9 +704,7 @@ _REMOTE_INSTALL_SNIPPET = (
     "\nos.replace(temporary,final)"
 )
 _REMOTE_DISCARD_SNIPPET = (
-    "import os,sys;"
-    "\ntry: os.unlink(sys.argv[1])"
-    "\nexcept FileNotFoundError: pass"
+    "import os,sys;\ntry: os.unlink(sys.argv[1])\nexcept FileNotFoundError: pass"
 )
 
 
@@ -737,8 +742,7 @@ def _finish_remote_staged_file(
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"could not install staged file on {host}: "
-            f"{result.stderr.strip()[:200]}"
+            f"could not install staged file on {host}: {result.stderr.strip()[:200]}"
         )
 
 
@@ -796,6 +800,62 @@ class StagingResult:
         }
 
 
+def _fabric_route(ssh_target: str, address: str | None) -> tuple[str, list[str]]:
+    """The scp host and leading options that reach ``ssh_target``.
+
+    A fabric address keeps the paired user and accepts only the host key
+    recorded for the paired name. OpenSSH keeps the first value of an option,
+    so these go before ``cluster_ssh_options``.
+    """
+
+    if address is None:
+        return ssh_target, []
+    user, _, host = ssh_target.rpartition("@")
+    return (f"{user}@{address}" if user else address), [
+        "-o",
+        f"HostKeyAlias={host}",
+        "-o",
+        "StrictHostKeyChecking=yes",
+    ]
+
+
+def fabric_transfer_address(ssh_target: str, addresses: Sequence[str]) -> str | None:
+    """The cluster fabric address to copy model files over, or None.
+
+    ``addresses`` are the ones the collectives verified, Thunderbolt and RDMA
+    first. One is used only when SSH answers there with the paired host key.
+    """
+
+    for address in addresses:
+        try:
+            if ipaddress.ip_address(address).version != 4:
+                continue
+        except ValueError:
+            continue
+        if address == ssh_target.rpartition("@")[2]:
+            continue
+        target, route_options = _fabric_route(ssh_target, address)
+        try:
+            probe = subprocess.run(
+                [
+                    "ssh",
+                    *route_options,
+                    *cluster_ssh_options(connect_timeout=3),
+                    target,
+                    "true",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return address
+    return None
+
+
 def scp_push(
     *,
     destination_host: str,
@@ -804,8 +864,12 @@ def scp_push(
     filename: str,
     cipher: str = _FAST_CIPHER,
     timeout: float = 3600.0,
+    transfer_address: str | None = None,
 ) -> None:
-    """Push one local model file to the Mac that needs it."""
+    """Push one local model file to the Mac that needs it.
+
+    ``transfer_address`` carries the file data; commands use the paired name.
+    """
 
     _validate_safe_relative_filename(filename)
     source = Path(source_dir).expanduser() / filename
@@ -833,20 +897,21 @@ def scp_push(
         f"{str(Path(destination_dir).expanduser()).rstrip('/')}/"
         f"{_staging_partial_name()}"
     )
-    final_path = (
-        f"{str(Path(destination_dir).expanduser()).rstrip('/')}/{filename}"
-    )
+    final_path = f"{str(Path(destination_dir).expanduser()).rstrip('/')}/{filename}"
     installed = False
+    scp_host, route_options = _fabric_route(destination_host, transfer_address)
     try:
         result = subprocess.run(
             [
                 "scp",
+                "-s",
                 "-q",
+                *route_options,
                 *cluster_ssh_options(connect_timeout=10),
                 "-c",
                 cipher,
                 str(source),
-                f"{destination_host}:{shlex.quote(temporary_path)}",
+                f"{scp_host}:{temporary_path}",
             ],
             capture_output=True,
             text=True,
@@ -902,8 +967,14 @@ def scp_copy(
     filename: str,
     cipher: str = _FAST_CIPHER,
     timeout: float = 3600.0,
+    source_address: str | None = None,
+    destination_address: str | None = None,
 ) -> None:
-    """Copy one model file between any two enrolled cluster nodes."""
+    """Copy one model file between any two enrolled cluster nodes.
+
+    A fabric address carries the data when one side is this Mac. A
+    peer-to-peer copy keeps the paired names: its options apply to both ends.
+    """
 
     _validate_safe_relative_filename(filename)
     source_local = is_local_host(source_host)
@@ -924,23 +995,33 @@ def scp_copy(
             filename=filename,
             cipher=cipher,
             timeout=timeout,
+            transfer_address=destination_address,
         )
         return
 
-    remote_source = shlex.quote(f"{source_dir.rstrip('/')}/{filename}")
+    # SFTP receives paths as arguments, not shell commands. Shell quotes here
+    # become literal filename characters, breaking directories with spaces.
+    remote_source = f"{source_dir.rstrip('/')}/{filename}"
+    # SFTP scp still expands remote source globs; quote their metacharacters.
+    remote_source = "".join(
+        "\\" + char if char in "\\*?[]" else char for char in remote_source
+    )
     if destination_local:
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
         temporary = destination / _staging_partial_name()
+        scp_host, route_options = _fabric_route(source_host, source_address)
         try:
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-q",
+                    *route_options,
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
-                    f"{source_host}:{remote_source}",
+                    f"{scp_host}:{remote_source}",
                     str(temporary),
                 ],
                 capture_output=True,
@@ -974,9 +1055,7 @@ def scp_copy(
                 f"could not create model directory on {destination_host}: "
                 f"{mkdir.stderr.strip()[:200]}"
             )
-        temporary_path = (
-            f"{destination_dir.rstrip('/')}/{_staging_partial_name()}"
-        )
+        temporary_path = f"{destination_dir.rstrip('/')}/{_staging_partial_name()}"
         final_path = f"{destination_dir.rstrip('/')}/{filename}"
         installed = False
         try:
@@ -985,13 +1064,14 @@ def scp_copy(
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-3",
                     "-q",
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
                     f"{source_host}:{remote_source}",
-                    f"{destination_host}:{shlex.quote(temporary_path)}",
+                    f"{destination_host}:{temporary_path}",
                 ],
                 capture_output=True,
                 text=True,
@@ -1027,8 +1107,13 @@ def stage_files_from_source(
     transfer: Any = scp_copy,
     progress: Callable[[str, str, int], None] | None = None,
     clock: Any = None,
+    source_address: str | None = None,
+    destination_address: str | None = None,
 ) -> StagingResult:
     """Stage one rank from a local or peer model holder and verify every file.
+
+    ``source_address`` and ``destination_address`` are fabric addresses from
+    ``fabric_transfer_address`` for the file data.
 
     ``destination_dir`` is where files land on the destination Mac; it defaults
     to the coordinator's own absolute source path, correct only when every Mac
@@ -1043,13 +1128,11 @@ def stage_files_from_source(
     # whose macOS account differs it names nothing, so resolve it in the
     # source peer's OWN home before using it as the scp source path — the
     # same treatment the destination side already gets from the caller.
-    # remote_model_dir does its own ~-abbreviation for transit (#7); it must
-    # receive the exact absolute path, not a pre-abbreviated one.
     local_dir = str(Path(model_path).expanduser())
     source_dir = (
         local_dir
         if is_local_host(source_host)
-        else remote_model_dir(source_host, local_dir)
+        else remote_model_dir(source_host, home_relative_model_path(str(model_path)))
     )
     destination_dir = destination_dir or source_dir
     expected = dict(expected_sizes)
@@ -1072,9 +1155,7 @@ def stage_files_from_source(
     ):
         raise RuntimeError("staging source returned an unsafe file inventory")
     if is_local_host(source_host) and not is_local_host(destination_host):
-        common = tuple(
-            name for name in expected if name not in set(plan.required)
-        )
+        common = tuple(name for name in expected if name not in set(plan.required))
         return stage_remote_files(
             plan,
             model_path=model_path,
@@ -1082,6 +1163,7 @@ def stage_files_from_source(
             destination_dir=destination_dir,
             sidecars=common,
             parallel=parallel,
+            transfer=partial(scp_push, transfer_address=destination_address),
             progress=progress,
             clock=clock,
         )
@@ -1113,6 +1195,14 @@ def stage_files_from_source(
     started = clock()
     transferred: list[str] = []
     failed: list[str] = []
+    routes = {
+        key: value
+        for key, value in (
+            ("source_address", source_address),
+            ("destination_address", destination_address),
+        )
+        if value is not None
+    }
 
     def copy(name: str) -> tuple[str, str | None]:
         if progress is not None:
@@ -1124,6 +1214,7 @@ def stage_files_from_source(
                 source_dir=source_dir,
                 destination_dir=destination_dir,
                 filename=name,
+                **routes,
             )
             return name, None
         except Exception as exc:  # noqa: BLE001 - reported per file
@@ -1287,22 +1378,18 @@ def remote_model_dir(
     *,
     timeout: float = 60.0,
 ) -> str:
-    """Resolve the coordinator's model path in the peer's OWN home.
+    """Expand a ``~``-form model path in the peer's OWN home.
 
     A cross-user cluster has a different ``$HOME`` per Mac, so the coordinator's
-    absolute path names nothing on the peer. ``model_dir`` is the coordinator's
-    own absolute (or already-portable) path; it is re-expressed in ``~``-form
-    here (#7 — callers must not pre-abbreviate it themselves, or a path outside
-    the coordinator's home is sent to the peer unexpanded) and resolved on the
-    peer, yielding the concrete directory its copy actually lives in, which the
+    absolute path names nothing on the peer. Resolving the ``~``-form on the
+    peer yields the concrete directory its copy actually lives in, which the
     present-file probe and the scp destination both need.
     """
 
-    portable = home_relative_model_path(model_dir)
     path = run_remote_python(
         ssh_target,
         _REMOTE_EXPAND_SNIPPET,
-        portable,
+        model_dir,
         description="resolve the model directory",
         python_executable="/usr/bin/python3",
         timeout=timeout,
@@ -1423,6 +1510,21 @@ class InsufficientDiskError(RuntimeError):
 _DISK_HEADROOM_BYTES = 10 * 1024**3
 
 
+def _remote_shell_path(path: str | Path) -> str:
+    """Quote ``path`` for a remote shell, keeping a leading ``~/`` unquoted.
+
+    The peer's shell must still expand ``~`` in its own home, but the rest of
+    the path is data and must not be read as shell syntax.
+    """
+
+    text = str(path)
+    if text == "~":
+        return text
+    if text.startswith("~/"):
+        return "~/" + shlex.quote(text[2:])
+    return shlex.quote(text)
+
+
 def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
     """Free bytes on the filesystem holding ``path``, locally or on a peer."""
 
@@ -1432,7 +1534,7 @@ def free_disk_bytes(path: str | Path, *, ssh_target: str | None = None) -> int:
                 "ssh",
                 *cluster_ssh_options(connect_timeout=10),
                 ssh_target,
-                f"df -k {shlex.quote(str(path))} | tail -1",
+                f"df -k {_remote_shell_path(path)} | tail -1",
             ],
             capture_output=True,
             text=True,
