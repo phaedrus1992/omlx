@@ -1,3 +1,5 @@
+> **Fork notice:** this is a fork of [jundot/omlx](https://github.com/jundot/omlx) that carries fixes upstream has not merged yet. It is meant to be short-lived. See [docs/FORK.md](docs/FORK.md) for why it exists and how to install it.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
