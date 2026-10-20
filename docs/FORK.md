@@ -156,10 +156,10 @@ oMLX can also download both from the admin dashboard.
 .venv-service/bin/omlx serve
 ```
 
-Open `http://127.0.0.1:8000/admin`.
-The first visit asks you to set an API key.
-Keep it, because clients need it.
-Stop the server with Ctrl-C after you have configured it in the next section.
+Open `http://127.0.0.1:8000/admin` and set an API key.
+Clients send the key as a bearer token, so keep it.
+Configure the server as the next section describes.
+Then stop it with Ctrl-C.
 
 ### 6. Configure
 
@@ -171,10 +171,10 @@ Scale the memory numbers to your Mac.
 | Setting | Value | Reason |
 | --- | --- | --- |
 | Memory → guard tier | `custom`, ceiling 48 GB | The preset tiers moved their ceiling between 9 and 35 GB while Splash was loading, and the model failed to load |
-| Integrations → Splash memory limit | 40 GB | The weights, the draft, scratch space and one full context window of KV pages |
+| Integrations → Splash memory limit | 40 GB | Splash planned a 40 GB budget for this model at load, inside the 48 GB guard |
 | Integrations → Splash SSD cache | 200 GB | Splash keeps prefix-cache pages on disk between restarts |
-| Integrations → KV cache precision | `int8` | Splash's default and its fast path |
-| Scheduler → max concurrent requests | 2 | One Claude Code session needs a main request plus helper requests |
+| Integrations → KV cache precision | `int8` | The fast path of Splash on Apple Silicon |
+| Scheduler → max concurrent requests | 2 | Splash does not batch a second prefill with decode, so more requests only slow each other down |
 | Model → max context window | 262144 | The full 256K window of the model |
 
 Then turn the model over to Splash.
@@ -275,9 +275,30 @@ The fork handles this in two ways.
 2. Claude Code 2.1.303 and later reads `CLAUDE_CODE_AUTO_MODE_MODEL` and sends the classifier to that model name.
    Point it at a model profile with thinking off.
 
-For the second way, create the profile in the dashboard: open the model's Model Settings, add a profile named `classifier`, and set `enable_thinking` to off.
+For the second way, add a profile with thinking off.
 The profile shares the model's engine, so it needs no extra memory.
 oMLX lists it as `Qwen3.6-35B-A3B-4bit:classifier`.
+The profile lives in `~/.omlx/model_profiles.json`:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "Qwen3.6-35B-A3B-4bit": {
+      "classifier": {
+        "name": "classifier",
+        "display_name": "Classifier (no thinking)",
+        "api_name": "classifier",
+        "description": "Claude Code auto-mode classifier: same engine, thinking off.",
+        "settings": { "enable_thinking": false },
+        "expose_as_model": true
+      }
+    }
+  }
+}
+```
+
+Restart the server after you edit the file.
 Then start Claude Code with:
 
 ```bash
