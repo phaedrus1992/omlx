@@ -2706,7 +2706,7 @@ class TestClaudeCodeSettings:
         assert settings.opus_model is None
 
     def test_classifier_steering_defaults(self):
-        """Steering defaults off, matching model_fallback's own default (#2)."""
+        """Steering defaults off."""
         settings = ClaudeCodeSettings()
         assert settings.steer_classifier_requests is False
         assert settings.classifier_model_tier == "haiku"
@@ -2946,7 +2946,7 @@ class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
     def test_claude_code_to_dict_has_seven_keys(self):
-        """to_dict must include all seven keys so GlobalSettings.save() persists them."""
+        """to_dict includes all seven keys, so GlobalSettings.save() keeps them."""
         s = ClaudeCodeSettings(
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
@@ -3039,41 +3039,87 @@ class TestClaudeCodeRouteIntegration:
         assert r.claude_code_steer_classifier_requests is None
         assert r.claude_code_classifier_model_tier is None
 
-    def test_update_global_settings_applies_classifier_steering(self):
+    def test_update_global_settings_applies_classifier_steering(
+        self, tmp_path, monkeypatch
+    ):
         """update_global_settings persists steer_classifier_requests and
-        classifier_model_tier onto GlobalSettings.claude_code (#2)."""
+        classifier_model_tier onto GlobalSettings.claude_code."""
         import asyncio
-        from unittest.mock import MagicMock
 
         from omlx.admin import routes
 
-        settings = MagicMock()
-        settings.claude_code.mode = "cloud"
-        settings.claude_code.steer_classifier_requests = False
-        settings.claude_code.classifier_model_tier = "haiku"
-        settings.server.host = "127.0.0.1"
-        settings.validate.return_value = []
-        settings.save.return_value = None
-        original = routes._get_global_settings
-        routes._get_global_settings = lambda: settings
-        try:
-            result = asyncio.run(
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(routes, "_get_global_settings", lambda: gs)
+
+        result = asyncio.run(
+            routes.update_global_settings(
+                request=routes.GlobalSettingsRequest(
+                    claude_code_steer_classifier_requests=True,
+                    claude_code_classifier_model_tier="sonnet",
+                ),
+                is_admin=True,
+            )
+        )
+
+        assert result["success"] is True
+        assert "claude_code" in result["runtime_applied"]
+        assert gs.claude_code.steer_classifier_requests is True
+        assert gs.claude_code.classifier_model_tier == "sonnet"
+
+    def test_unknown_classifier_tier_is_rejected_by_the_request_model(self):
+        from pydantic import ValidationError
+
+        from omlx.admin import routes
+
+        with pytest.raises(ValidationError):
+            routes.GlobalSettingsRequest(claude_code_classifier_model_tier="gpt")
+
+    def test_failed_validation_leaves_claude_code_settings_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(routes, "_get_global_settings", lambda: gs)
+
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(
                 routes.update_global_settings(
                     request=routes.GlobalSettingsRequest(
+                        claude_code_mode="bogus",
                         claude_code_steer_classifier_requests=True,
-                        claude_code_classifier_model_tier="sonnet",
                     ),
                     is_admin=True,
                 )
             )
-        finally:
-            routes._get_global_settings = original
 
-        assert result["success"] is True
-        assert "claude_code" in result["runtime_applied"]
-        assert settings.claude_code.steer_classifier_requests is True
-        assert settings.claude_code.classifier_model_tier == "sonnet"
-        settings.save.assert_called_once()
+        assert err.value.status_code == 400
+        assert gs.claude_code.mode == "cloud"
+        assert gs.claude_code.steer_classifier_requests is False
+
+    def test_global_settings_response_includes_classifier_steering(self, tmp_path):
+        from omlx.admin import routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.steer_classifier_requests = True
+        gs.claude_code.classifier_model_tier = "opus"
+
+        claude_code = routes._global_settings_response(gs)["claude_code"]
+
+        assert claude_code["steer_classifier_requests"] is True
+        assert claude_code["classifier_model_tier"] == "opus"
+
+    def test_from_dict_ignores_an_unknown_tier_and_coerces_the_flag(self):
+        cc = ClaudeCodeSettings.from_dict(
+            {"classifier_model_tier": "gpt", "steer_classifier_requests": 1}
+        )
+
+        assert cc.classifier_model_tier == "haiku"
+        assert cc.steer_classifier_requests is True
 
     @pytest.mark.parametrize(
         ("before", "after", "action"),

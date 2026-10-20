@@ -720,75 +720,32 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     return ""
 
 
-# Claude Code's auto-mode Bash safety classifier identifies itself by this
-# sentence in its system prompt. The match is a substring test, not a prefix
-# test, on purpose: Claude Code sends the system prompt as several blocks and
-# may reorder or prepend one. A prefix check would then stop matching with no
-# signal at all, which is the silent regression this whole change exists to
-# prevent. Matching on it (rather than on the legacy
-# ``x-anthropic-billing-header:`` marker) is deliberate: that header also
-# appears on ordinary Agent SDK turns, so keying off it would disable thinking
-# on every request. See issue #1.
+# Claude Code's auto-mode Bash safety classifier names itself in its system
+# prompt. The match is a substring test, not a prefix test, because Claude Code
+# sends the system prompt as several blocks and may reorder or prepend one.
+# The legacy ``x-anthropic-billing-header:`` marker is not usable: it also
+# appears on ordinary Agent SDK turns, so it would disable thinking everywhere.
 _CLASSIFIER_SYSTEM_MARKER = "you are a security monitor for autonomous ai coding agents"
-
-# Envelope details observed alongside the marker on Claude Code 2.1.246. They
-# are deliberately *not* part of the match — they feed drift reporting instead,
-# so a format change surfaces as a log line rather than a silent regression.
-_CLASSIFIER_MAX_TOKENS_CEILING = 4096
-_CLASSIFIER_STOP_SEQUENCE = "</block>"
-_CLASSIFIER_TRANSCRIPT_OPEN = "<transcript>"
-_CLASSIFIER_TRANSCRIPT_CLOSE = "</transcript>"
-
-
-def _user_message_text(messages: list[AnthropicMessage] | None) -> str:
-    """Concatenate the text of every user message, for structural checks only."""
-    if not messages:
-        return ""
-
-    parts: list[str] = []
-    for message in messages:
-        if getattr(message, "role", None) != "user":
-            continue
-        content = getattr(message, "content", None)
-        if isinstance(content, str):
-            parts.append(content)
-            continue
-        for block in content or []:
-            # Normalize via the same helper the other extraction sites use, so
-            # this agrees with them on which blocks count as text.
-            block_dict = _content_block_to_dict(block)
-            if block_dict is None or block_dict.get("type") != "text":
-                continue
-            text = block_dict.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-    return "".join(parts)
 
 
 def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
     """True if this is Claude Code's auto-mode Bash safety-classifier request.
 
-    Claude Code sends this request before running a Bash command that its
-    static allow/deny rules don't cover. It carries no ``thinking`` field, so a
-    reasoning model falls through to its own default and reasons past Claude
-    Code's ~35-45 second deadline — the request is then cancelled and the user
-    sees "model is temporarily unavailable" (issue #1, and jundot/omlx#2067).
+    Claude Code sends this request before it runs a Bash command that its
+    static allow and deny rules do not cover. The request has no ``thinking``
+    field, so a reasoning model uses its own default and reasons past Claude
+    Code's deadline of about 35-45 seconds. Claude Code then cancels the
+    request, and the user sees "model is temporarily unavailable"
+    (see jundot/omlx#2067).
 
-    Auto mode fails closed today: with no verdict the Bash action is refused,
-    not allowed — see the error text quoted in jundot/omlx#2067. So this trades
-    "no verdict, action blocked" for "a verdict reached without extended
-    reasoning". That is an availability fix with a real accuracy cost, and it
-    is why the match is kept narrow. Giving the classifier its own small, fast
-    model is the better long-term answer and is tracked in #2.
-
-    Three conditions must all hold:
+    Auto mode fails closed: with no verdict, Claude Code refuses the action.
+    A reply without extended reasoning is better than no reply, but it costs
+    some accuracy, so the match stays narrow. Three conditions must all hold:
 
     1. the system prompt contains the security-monitor marker anywhere,
-    2. the request is not streaming — the classifier never streams,
-    3. the request carries no tools — an ordinary conversation turn that merely
-       *discusses* the classifier still has Claude Code's tool array attached.
-
-    Conditions 2 and 3 are what keep a normal turn from ever matching.
+    2. the request is not streaming, because the classifier never streams,
+    3. the request carries no tools, because an ordinary turn that only
+       discusses the classifier still has Claude Code's tool array attached.
     """
     system_text = _extract_system_text(request.system) if request.system else ""
     if _CLASSIFIER_SYSTEM_MARKER not in system_text.lower():
@@ -796,40 +753,6 @@ def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
     if request.stream is True:
         return False
     return not request.tools
-
-
-def classifier_envelope_drift(request: MessagesRequest) -> list[str]:
-    """Report which known classifier envelope traits no longer hold.
-
-    Returns an empty list when the request matches the shape captured from
-    Claude Code 2.1.246. Any entry means Anthropic changed the envelope, which
-    is worth a warning: the marker still matched, so the patch still applies,
-    but the match is running on thinner evidence than when it was written.
-
-    Reasons name only the field that drifted. They are logged, so they must
-    never carry prompt, message, or tool content.
-    """
-    reasons: list[str] = []
-
-    max_tokens = request.max_tokens
-    if not isinstance(max_tokens, int) or max_tokens > _CLASSIFIER_MAX_TOKENS_CEILING:
-        reasons.append(
-            f"max_tokens={max_tokens} exceeds expected ceiling "
-            f"{_CLASSIFIER_MAX_TOKENS_CEILING}"
-        )
-
-    stop_sequences = request.stop_sequences or []
-    if _CLASSIFIER_STOP_SEQUENCE not in stop_sequences:
-        reasons.append(f"stop_sequences missing {_CLASSIFIER_STOP_SEQUENCE!r}")
-
-    transcript = _user_message_text(request.messages)
-    if (
-        _CLASSIFIER_TRANSCRIPT_OPEN not in transcript
-        or _CLASSIFIER_TRANSCRIPT_CLOSE not in transcript
-    ):
-        reasons.append("messages missing <transcript> tags")
-
-    return reasons
 
 
 def _normalize_in_messages_system(

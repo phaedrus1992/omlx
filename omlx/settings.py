@@ -903,6 +903,9 @@ class UsageSettings:
         return cls(usage_history=data.get("usage_history", True))
 
 
+CLASSIFIER_MODEL_TIERS = ("opus", "sonnet", "haiku")
+
+
 @dataclass
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
@@ -913,10 +916,9 @@ class ClaudeCodeSettings:
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
-    # Serve Claude Code's auto-mode Bash safety-classifier requests (#1's
-    # predicate) with a configured tier's model instead of whatever the
-    # active session requested. Off by default, matching model_fallback's
-    # own opt-in default (#2).
+    # Serve Claude Code's auto-mode Bash safety-classifier requests with the
+    # model of the chosen tier instead of the model the session asked for.
+    # Off by default.
     steer_classifier_requests: bool = False
     classifier_model_tier: str = "haiku"
     # When True, oMLX exposes derived Claude Desktop tier aliases
@@ -939,13 +941,22 @@ class ClaudeCodeSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
+        tier = data.get("classifier_model_tier", "haiku")
+        if tier not in CLASSIFIER_MODEL_TIERS:
+            logger.warning(
+                "Ignoring invalid claude_code classifier_model_tier %r; using 'haiku'",
+                tier,
+            )
+            tier = "haiku"
         return cls(
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
             haiku_model=data.get("haiku_model"),
-            steer_classifier_requests=data.get("steer_classifier_requests", False),
-            classifier_model_tier=data.get("classifier_model_tier", "haiku"),
+            steer_classifier_requests=bool(
+                data.get("steer_classifier_requests", False)
+            ),
+            classifier_model_tier=tier,
             desktop_enabled=data.get("desktop_enabled", False),
         )
 
@@ -1880,7 +1891,7 @@ class GlobalSettings:
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
             )
-        valid_classifier_tiers = {"opus", "sonnet", "haiku"}
+        valid_classifier_tiers = set(CLASSIFIER_MODEL_TIERS)
         if self.claude_code.classifier_model_tier not in valid_classifier_tiers:
             errors.append(
                 f"Invalid claude_code classifier_model_tier: "
