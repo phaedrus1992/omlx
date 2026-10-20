@@ -73,6 +73,8 @@ MIN_SPLASH_VERSION = (1, 3, 0)
 MIXED_QUANTIZATION_VERSION = (1, 3, 1)
 # Splash reads a per-request thinking_token_budget from 1.3.2 on.
 THINKING_BUDGET_VERSION = (1, 3, 2)
+# Splash stores recurrent states as bf16 with --state-format from 1.3.2 on.
+STATE_FORMAT_VERSION = (1, 3, 2)
 # Splash loads Model Optimizer and compressed-tensors NVFP4/FP8 from 1.3.2 on.
 NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
@@ -160,6 +162,10 @@ class SplashBinary:
     @property
     def accepts_thinking_budget(self) -> bool:
         return self.version_tuple >= THINKING_BUDGET_VERSION
+
+    @property
+    def accepts_state_format(self) -> bool:
+        return self.version_tuple >= STATE_FORMAT_VERSION
 
     @property
     def loads_nvidia_quantization(self) -> bool:
@@ -918,6 +924,8 @@ class SplashOptions:
     max_context: int | None = None
     max_memory_bytes: int = 0
     kv_format: str = "int8"
+    state_format: str = "fp32"
+    decode_share: float | None = None
     ane_prefill: bool = True
     cache_disk_bytes: int = 0
     cache_dir: Path | None = None
@@ -1069,6 +1077,18 @@ class SplashEngine(BaseEngine):
             ]
         if options.max_memory_bytes > 0:
             command += ["--max-memory", str(options.max_memory_bytes)]
+        if options.state_format != "fp32":
+            if self._target.binary.accepts_state_format:
+                command += ["--state-format", options.state_format]
+            else:
+                logger.warning(
+                    "Splash %s cannot store %s recurrent states; using fp32. "
+                    "Splash 1.3.2 or later takes --state-format.",
+                    self._target.binary.version,
+                    options.state_format,
+                )
+        if options.decode_share is not None:
+            command += ["--decode-share", str(options.decode_share)]
         if not options.ane_prefill:
             command.append("--disable-ane")
         if options.cache_disk_bytes > 0 and options.cache_dir is not None:
