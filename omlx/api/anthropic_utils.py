@@ -859,7 +859,9 @@ def _normalize_in_messages_system(
             if content:
                 extracted_parts.append(content)
         elif isinstance(content, list):
-            extracted_parts.extend(text for text in _text_from_content_blocks(content) if text)
+            extracted_parts.extend(
+                text for text in _text_from_content_blocks(content) if text
+            )
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:
@@ -949,7 +951,9 @@ def _extract_tool_result_content(
                 continue
             item_dict = _content_block_to_dict(item)
             if item_dict is not None and item_dict.get("type") == "text":
-                text_parts.append(item_dict.get("text", ""))
+                text = item_dict.get("text", "")
+                if isinstance(text, str):
+                    text_parts.append(text)
         result_text = "\n".join(text_parts)
     elif isinstance(content, dict):
         if content.get("type") == "text":
@@ -1022,12 +1026,8 @@ def convert_anthropic_tools_to_internal(
     dropped: list[str] = []
 
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        tool_dict = _content_block_to_dict(tool)
+        if tool_dict is None:
             continue
 
         if _is_server_side_tool(tool_dict):
