@@ -74,6 +74,37 @@ def _is_auxiliary_shard(filename: str) -> bool:
 DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
 
 
+def _validate_safe_relative_filename(filename: str) -> None:
+    """Reject a path that escapes the model root or names an absolute location.
+
+    A one-level subdirectory is legitimate — OptiQ VLM checkpoints index
+    ``optiq/optiq_vision.safetensors`` alongside the numbered decoder shards —
+    so only ``..`` traversal and absolute paths are refused, not every
+    filename with a ``/`` in it.
+    """
+
+    path = Path(filename)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"unsafe filename: {filename!r}")
+
+
+def _is_auxiliary_shard(filename: str) -> bool:
+    """Whether ``filename`` sits outside the flat, pipeline-splittable shard set.
+
+    Every decoder shard this module has ever staged lives flat in the model
+    root — that assumption is load-bearing throughout this file. A nested
+    path is therefore never a decoder shard by construction: it is an
+    auxiliary weight file the publisher deliberately separated out (e.g.
+    OptiQ's ``optiq/optiq_vision.safetensors``, a vision encoder). Its tensor
+    names cannot be trusted to carry a decoder layer index — a vision encoder
+    commonly reuses "blocks.N"/"layers.N" naming with its own, unrelated
+    numbering, so running it through ``_LAYER`` would attribute it to a
+    decoder layer by coincidence, not by fact.
+    """
+
+    return len(Path(filename).parts) > 1
+
+
 def is_local_host(host: str) -> bool:
     """Whether this address names this machine, so ssh would be a detour."""
 
