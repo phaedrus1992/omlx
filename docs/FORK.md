@@ -5,6 +5,67 @@ It is meant to be short-lived.
 Each change in it is also sent upstream, and the fork shrinks as upstream accepts them.
 This file explains why the fork exists and how to install it from nothing on a new Mac.
 
+## Quick start
+
+This gets an M1 or M2 Max with 64 GB to the setup the author runs.
+Each step links to a longer section.
+Scale the memory numbers if your Mac has less memory.
+
+1. Install the tools: `brew install uv python@3.14 git`.
+2. Install Splash M1 ([step 1](#1-install-splash)).
+   On an M3 or later Mac, install the official Splash instead.
+3. Get the fork and create the Python environment ([steps 2 and 3](#2-get-the-fork)).
+4. Download the model and its draft model ([step 4](#4-download-the-models)).
+5. Start the server once, set an API key in the dashboard, and stop the server ([step 5](#5-start-the-server-once-by-hand)).
+6. Merge these values into `~/.omlx/settings.json`:
+
+   ```json
+   {
+     "memory": { "memory_guard_tier": "custom", "memory_guard_custom_ceiling_gb": 48.0 },
+     "scheduler": { "max_concurrent_requests": 2 },
+     "integrations": {
+       "splash_kv_format": "int8",
+       "splash_max_memory_gb": 40.0,
+       "splash_ssd_cache_gb": 200,
+       "splash_state_format": "fp32",
+       "splash_decode_share": 0.15
+     }
+   }
+   ```
+
+7. Add this entry under `models` in `~/.omlx/model_settings.json`:
+
+   ```json
+   "Qwen3.6-35B-A3B-4bit": {
+     "external_engine": "splash",
+     "max_context_window": 262144,
+     "temperature": 0.6,
+     "top_p": 0.95,
+     "top_k": 20,
+     "force_sampling": true,
+     "thinking_budget_enabled": true,
+     "thinking_budget_tokens": 1024
+   }
+   ```
+
+8. Run the server under launchd ([step 7](#7-run-it-under-launchd)).
+9. Point Claude Code at it ([Use it with Claude Code](#use-it-with-claude-code)).
+   Use the one model for the opus, sonnet and haiku slots.
+   Add the classifier profile, and export `CLAUDE_CODE_AUTO_MODE_MODEL`.
+10. Check the cache ([Check the cache](#check-the-cache)).
+
+Three values in these files matter more than the rest.
+
+- `force_sampling` with temperature 0.6 stops the model from printing commands instead of calling tools.
+  See [The model prints a command instead of running it](#the-model-prints-a-command-instead-of-running-it).
+- `splash_state_format` and `splash_kv_format` stay at the defaults above.
+  We found no gain from the alternatives.
+- `splash_decode_share` of 0.15 is an experiment for several sessions at once.
+  The default is 0.5.
+  See [Several sessions at once](#several-sessions-at-once).
+
+The evidence behind these choices is in [`splash-moe-investigation.md`](splash-moe-investigation.md).
+
 ## Why the fork exists
 
 The fork runs Claude Code against a local Qwen3.6-35B-A3B model that Splash serves.
@@ -329,8 +390,11 @@ These numbers are from an M1 Max with 64 GB, Splash M1 1.3.2 and Qwen3.6-35B-A3B
 - Prefill runs at about 160 tokens per second.
   A cold 70K-token prompt takes about 7 minutes.
   Prefill is most of the wait in an agent session, so the cache matters more than decode speed.
-- Decode runs at about 75 tokens per second on a short chat.
-  It falls toward 25 tokens per second at a long context, or while a second request prefills.
+- Decode runs at about 75–110 tokens per second on a short reply of tool-call text.
+  In agent sessions it is 10–30 tokens per second and it varies a lot.
+  Speculative decoding gets 5–7 tokens per cycle on code and tool calls, and 2–3 on prose and thinking.
+  The same request ran up to 1.7 times slower a few minutes later, after Splash reported a thermal state of fair.
+  Another request that prefills at the same time also slows decode.
 - Qwen3.8-27B decodes at about 21 tokens per second, and a 92K-token prefill takes more than 20 minutes.
   Use the 35B-A3B model on an M1 or M2 Mac.
 - One Qwen model of 24–27 GB fits in memory at a time on a 64 GB Mac.
@@ -401,6 +465,63 @@ Set `CLAUDE_STREAM_IDLE_TIMEOUT_MS` (and `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`) t
 The classifier is a different case.
 It was cancelled after about 60 seconds because it thought for 600–900 tokens at 10–14 tokens per second.
 Turn its thinking off, as described above.
+
+### The model prints a command instead of running it
+
+Symptom: a turn ends after a few seconds.
+Claude writes the command in a code fence, calls no tool, and may blame the hook output for "truncated output".
+No command ran, so there was no output to truncate.
+
+The cause is sampling plus the history.
+The model sometimes writes a command as text at temperature 1.0, which is the Claude Code default.
+Once one earlier turn holds a printed command, the model copies it on every later turn.
+In replays of a captured request, the model called the tool in 4 of 4 runs with no earlier printed command, 1 of 4 with one, and 0 of 4 with three.
+At temperature 1.0 we saw 1 miss in 12 first turns.
+At temperature 0.6 we saw none in 12.
+With `force_sampling` on at 0.6, 40 of 41 later tool turns made tool calls, and the one stop was a correct answer.
+
+The fix is the sampling in the quick start.
+To recover a session that already loops, press Esc twice or run `/rewind` to a turn before the first printed command.
+If the first turn of the session already failed, run `/clear`.
+
+### A `/goal` check times out
+
+`/goal` sends the whole conversation to the small fast model after every turn.
+Here that is the same 35B model, and its prompt shares only a small prefix with the main thread.
+A 40K-token check is a cold prefill of about 250 seconds, and a prompt-based hook has a 30-second timeout.
+The check cannot finish, and it holds up the next turn.
+Do not use `/goal` on this setup.
+A Stop hook with a longer `timeout` is an alternative that we did not try.
+
+### Several sessions at once
+
+Each Claude Code session sends main turns, and auto mode adds a classifier request per tool call.
+Splash does not batch a second prefill with decode, so two sessions slow each other down.
+A classifier request whose prompt has a few thousand new tokens waited 11–25 seconds for its first token while two other sessions ran.
+One was cancelled after 69 seconds.
+
+`splash_decode_share` sets how much decode time other requests are owed for each unit of prefill time.
+The default is 0.5.
+We lowered it to 0.15 so that a classifier prefill gets more of the GPU.
+In the first 30 minutes with two sessions, cache hits stayed at 99%, but main-turn decode was a median of 6 tokens per second.
+Three classifier-sized requests were cancelled, and Claude Code did not show a warning.
+We do not know yet if 0.15 helps.
+If decode stays slow, raise it to 0.3 or return to the default.
+
+Narrow allow rules such as `Bash(git commit *)` are resolved before the classifier runs.
+They remove the classifier call for routine commands, and they matter most for runs without someone at the keyboard.
+
+### Decode is slower than expected
+
+- Compare like with like.
+  Speed depends on how predictable the text is, on what else runs, and on the thermal state.
+- We found no effect from Splash 1.3.2-m1.1 against m1.2, `int8` against `bf16` KV, `--state-format bf16`, or `--decode-share 1.0`.
+- A thinking budget of 1024 tokens costs nothing that we saw.
+  It protects against a runaway thinking loop.
+  It is not a proven speed gain.
+- macOS sometimes aborts a GPU command with "Impacting Interactivity".
+  Splash restarts its engine in about 17 seconds, and oMLX returns HTTP 500 to the client.
+  Keep other GPU work off the Mac while the server runs.
 
 ### The server did not start
 
