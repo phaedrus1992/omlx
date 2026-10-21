@@ -17,7 +17,6 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
-    _read,
     _rdma_port_state,
     _read,
     _run_link_command,
