@@ -16,22 +16,22 @@ Each one has a fix in this fork and a pull request upstream.
 | --- | --- | --- | --- |
 | oMLX folds Claude Code's mid-conversation system messages into the first system message | The prompt changes on every turn, so the prefix cache misses and the whole prompt is processed again | [#4697](https://github.com/jundot/omlx/issues/4697) | [#4708](https://github.com/jundot/omlx/pull/4708) |
 | The Splash engine does not send `preserve_thinking` | Splash drops earlier reasoning from the prompt, and the cache misses after each user message | [#4701](https://github.com/jundot/omlx/issues/4701) | [#4709](https://github.com/jundot/omlx/pull/4709) |
-| The Claude Code auto-mode classifier request gets thinking blocks it never asked for | The classifier is slow and its plain-text answer breaks | none | [#3193](https://github.com/jundot/omlx/pull/3193), closed by the stale bot for conflicts |
+| The Claude Code auto-mode classifier request gets thinking blocks it never asked for | The classifier is slow and its plain-text answer breaks | none | [#4714](https://github.com/jundot/omlx/pull/4714) (replaces #3193, which the stale bot closed for conflicts) |
 
 With the first two fixes, prefix-cache reuse on a 70K-token Claude Code session went from about 25–48% to 98–99.7% per turn.
 The measured numbers are in the comments on #4697 and #4701.
 
-The fork also carries cluster fixes and a refactor that are open upstream or were closed for conflicts.
+The fork also carries cluster fixes and a refactor that are open upstream or wait for a new pull request.
 
 | Change | Upstream PR |
 | --- | --- |
 | Show the real reason tensor-parallel planning fails | [#3197](https://github.com/jundot/omlx/pull/3197) |
 | Keep a self-assigned Thunderbolt Bridge address as a link candidate | [#3205](https://github.com/jundot/omlx/pull/3205) |
 | Share Anthropic content-block text extraction, with property tests | [#3194](https://github.com/jundot/omlx/pull/3194) |
-| Send remote nodes an absolute model path | [#3196](https://github.com/jundot/omlx/pull/3196), closed |
-| Stage safetensors shards from a subdirectory | [#3204](https://github.com/jundot/omlx/pull/3204), closed |
-| Fall back to a TCP probe when the link ping fails | [#3206](https://github.com/jundot/omlx/pull/3206), closed |
-| Retry flaky mDNS resolution in cluster SSH probes | [#3208](https://github.com/jundot/omlx/pull/3208), closed |
+| Send remote nodes an absolute model path | [#3196](https://github.com/jundot/omlx/pull/3196) was closed by the stale bot. Upstream `remote_model_dir` may already cover it. A check is pending. |
+| Stage safetensors shards from a subdirectory | Branch `fix/cluster-nested-shard-staging` is current. New pull request pending (replaces #3204). |
+| Fall back to a TCP probe when the link ping fails | Branch `fix/cluster-link-ping-tcp-fallback` is current. New pull request pending (replaces #3206). |
+| Retry flaky mDNS resolution in cluster SSH probes | Branch `fix/cluster-mdns-probe-retry` is current. New pull request pending (replaces #3208). |
 
 When upstream merges a change, the fork drops its own copy at the next sync.
 When upstream merges all of them, delete the fork.
