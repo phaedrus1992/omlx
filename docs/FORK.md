@@ -359,8 +359,11 @@ TTFT is the time to the first token.
   The fork reuses 31,488 of 35,079 tokens.
 - The fork keeps the system reminder in place, and it sends `preserve_thinking` to Splash.
   Without these two changes, Splash renders the earlier prompt in a different way and the prefix no longer matches.
-- The `bf16` and `decode-share` options do not change the result on this load.
-  They are not a cache fix.
+- The `bf16` and `decode-share` options do not change the cache result or the decode speed at this context size.
+  At 100K tokens of context, decode ran at a median of 16.6 tokens per second with both options on.
+  It ran at a median of 27.2 tokens per second with both options off.
+  The sample after the change is small (6 requests).
+  Leave `splash_state_format` at `fp32` and `splash_decode_share` unset.
 - Real Claude Code sessions with a 70K-token context showed 98–99.7% cache hits on the fork.
   Before the fix the same sessions showed 25–48%.
 - A small resident model for the auto-mode classifier did not help.
