@@ -130,7 +130,6 @@ def test_read_remote_marker_gives_up_after_exhausting_retries(monkeypatch):
     assert len(calls) == 3
 
 
-
 def test_an_unreachable_peer_is_reported_not_raised(tmp_path):
     health = check_peers(
         HOSTS,
