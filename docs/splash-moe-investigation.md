@@ -212,6 +212,29 @@ Too big: gpt-oss-120b, Qwen3-Coder-Next 80B, and Nemotron 3 Super.
 The sources are mostly listicles.
 None tested an M1 Max with Claude Code.
 
+### 9. A Qwen3.8-27B fine-tune as GGUF
+
+We tried `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF`, file `...NEO-CODER-MAX-Q4_K_M.gguf` (18 GB), with `incoai/Qwen3.8-27B-DFlash2` as the draft.
+oMLX recognized the file as a Splash model, and Splash loaded it on the second try.
+The first load took 353 seconds: it hashes the file once and measures the Neural Engine split.
+
+Results on the M1 Max:
+
+| Measure | Value |
+| --- | --- |
+| Tool calls on a short Bash-tool prompt | 6 of 6 |
+| Decode | 2.1–2.7 tok/s |
+| Tokens per cycle | 1.2–1.3 (the draft model is almost never accepted) |
+| Cycle time | about 540 ms |
+| Prefill, 27K-token prompt | no result: after about 12 minutes macOS aborted a GPU command ("Impacting Interactivity") |
+
+Stock Qwen3.8-27B measured 21 tok/s on this machine, so this file is about 8 times slower.
+Two causes are possible, and we did not separate them.
+The DFlash2 draft was trained on the stock model, and this fine-tune and merge may not match it.
+GGUF decode on M1 is also less tested: the Splash M1 release notes say GGUF models were not run end to end on M1.
+We do not recommend this file.
+A dense 27B is also too slow at prefill for 50K-token agent sessions, as the stock model showed.
+
 ## Plan
 
 Work in this order.
