@@ -1591,8 +1591,8 @@ def _tcp_probe_succeeds(
 
     bound = run(
         local.host,
-        # Absolute like the other remote stdlib probes: a bare
-        # python3 resolves through the login shell's PATH.
+        # Absolute like the other remote stdlib probes: a bare python3
+        # resolves through the login shell's PATH.
         ("/usr/bin/python3", "-c", _TCP_PROBE_SCRIPT, local.address, remote.address),
     )
     return bound.returncode == 0
