@@ -336,6 +336,46 @@ These numbers are from an M1 Max with 64 GB, Splash M1 1.3.2 and Qwen3.6-35B-A3B
 - One Qwen model of 24–27 GB fits in memory at a time on a 64 GB Mac.
   Loading a second one evicts the first, and a reload takes about a minute.
 
+## Benchmarks
+
+`scripts/bench_splash_session.py` replays a synthetic agent session against a real server and reads the cache numbers from the Splash log.
+Each session has 9 turns, 14 tools, and a 2,000-token system prompt.
+Each turn adds a 1,500-token tool result.
+Turn 5 adds a new user message.
+Every third turn adds a trailing system reminder, as Claude Code does.
+The model is Qwen3.6-35B-A3B-4bit on an M1 Max with 64 GB, with Splash M1 1.3.2.
+Each arm ran 2 sessions.
+
+| Arm | Cache hit, turns 2–9 | Prefilled tokens | Median TTFT | p90 TTFT | Session time |
+|---|---|---|---|---|---|
+| oMLX 0.7.1 | 60.1% | 144,712 | 8.6 s | 32.8 s | 3.0 min |
+| Fork | 84.6% | 56,324 | 8.1 s | 9.5 s | 1.7 min |
+| Fork, `--state-format bf16` and `--decode-share 1.0` | 84.6% | 56,304 | 7.9 s | 9.3 s | 1.7 min |
+
+TTFT is the time to the first token.
+
+- oMLX 0.7.1 loses most of the cache on turns 3, 6, and 9 (the reminder turns).
+  On turn 9 it reuses 7,008 of 34,736 tokens.
+  The fork reuses 31,488 of 35,079 tokens.
+- The fork keeps the system reminder in place, and it sends `preserve_thinking` to Splash.
+  Without these two changes, Splash renders the earlier prompt in a different way and the prefix no longer matches.
+- The `bf16` and `decode-share` options do not change the result on this load.
+  They are not a cache fix.
+- Real Claude Code sessions with a 70K-token context showed 98–99.7% cache hits on the fork.
+  Before the fix the same sessions showed 25–48%.
+- A small resident model for the auto-mode classifier did not help.
+  A 4B model in process prefilled at about 110 tokens per second.
+  Splash prefilled the 35B model at about 160 tokens per second.
+
+To repeat the run, stop the live service first.
+The run uses the GPU and slows down other sessions.
+
+1. Install each arm in its own environment.
+2. Run `python scripts/bench_splash_session.py --arm stock=<omlx> --arm fork=<python> --turns 9 --followup-after 5 --result-tokens 1500 --system-tokens 2000 --repeat 2 --out results.json`.
+3. Start each server from a directory that is not an oMLX checkout.
+   The script does this for you.
+   A checkout in the current directory replaces the installed package.
+
 ## Troubleshooting
 
 ### The cache hit rate is low
