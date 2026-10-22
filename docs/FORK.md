@@ -16,6 +16,10 @@ Scale the memory numbers if your Mac has less memory.
    On an M3 or later Mac, install the official Splash instead.
 3. Get the fork and create the Python environment ([steps 2 and 3](#2-get-the-fork)).
 4. Download the model and its draft model ([step 4](#4-download-the-models)).
+   The author runs `mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit`, a coding fine-tune of Qwen3.6-35B-A3B.
+   It uses the same draft model, `incoai/Qwen3.6-35B-A3B-DFlash2`, and the same Splash settings.
+   Download it the same way as the base model:
+   `.venv-service/bin/hf download mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit --local-dir ~/.omlx/models/mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit`.
 5. Start the server once, set an API key in the dashboard, and stop the server ([step 5](#5-start-the-server-once-by-hand)).
 6. Merge these values into `~/.omlx/settings.json`:
 
@@ -36,7 +40,7 @@ Scale the memory numbers if your Mac has less memory.
 7. Add this entry under `models` in `~/.omlx/model_settings.json`:
 
    ```json
-   "Qwen3.6-35B-A3B-4bit": {
+   "KAT-Coder-V2.5-Dev-OptiQ-4bit": {
      "external_engine": "splash",
      "max_context_window": 262144,
      "temperature": 0.6,
@@ -51,7 +55,7 @@ Scale the memory numbers if your Mac has less memory.
 8. Run the server under launchd ([step 7](#7-run-it-under-launchd)).
 9. Point Claude Code at it ([Use it with Claude Code](#use-it-with-claude-code)).
    Use the one model for the opus, sonnet and haiku slots.
-   Add the classifier profile, and export `CLAUDE_CODE_AUTO_MODE_MODEL`.
+   Add the classifier profile for that model (the profile in the next section, under the name `KAT-Coder-V2.5-Dev-OptiQ-4bit`), and export `CLAUDE_CODE_AUTO_MODE_MODEL` as `KAT-Coder-V2.5-Dev-OptiQ-4bit:classifier`.
 10. Check the cache ([Check the cache](#check-the-cache)).
 
 Three values in these files matter more than the rest.
