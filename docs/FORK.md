@@ -132,24 +132,31 @@ On this class of Mac, try KAT-Coder first with a short context, and move to Nemo
 
 The fork runs Claude Code against a local Qwen3.6-35B-A3B model that Splash serves.
 Splash is an external inference engine that oMLX can start for a model.
-Three problems made that setup slow or broken on upstream `main`.
-Each one has a fix in this fork and a pull request upstream.
+Three problems made that setup slow or broken on upstream `main` before v0.7.2.
+Upstream fixed all three, and the fork now uses the upstream fixes.
 
-| Problem | Effect | Upstream issue | Upstream PR |
+| Problem | Effect | Upstream issue | Upstream fix |
 | --- | --- | --- | --- |
-| oMLX folds Claude Code's mid-conversation system messages into the first system message | The prompt changes on every turn, so the prefix cache misses and the whole prompt is processed again | [#4697](https://github.com/jundot/omlx/issues/4697) | [#4708](https://github.com/jundot/omlx/pull/4708) |
-| The Splash engine does not send `preserve_thinking` | Splash drops earlier reasoning from the prompt, and the cache misses after each user message | [#4701](https://github.com/jundot/omlx/issues/4701) | [#4709](https://github.com/jundot/omlx/pull/4709) |
-| The Claude Code auto-mode classifier request gets thinking blocks it never asked for | The classifier is slow and its plain-text answer breaks | none | [#4714](https://github.com/jundot/omlx/pull/4714) (replaces #3193, which the stale bot closed for conflicts) |
+| oMLX folded Claude Code's mid-conversation system messages into the first system message | The prompt changed on every turn, so the prefix cache missed and the whole prompt was processed again | [#4697](https://github.com/jundot/omlx/issues/4697) | [#4708](https://github.com/jundot/omlx/pull/4708) and [#4712](https://github.com/jundot/omlx/pull/4712) |
+| The Splash engine did not send `preserve_thinking` | Splash dropped earlier reasoning from the prompt, and the cache missed after each user message | [#4701](https://github.com/jundot/omlx/issues/4701) | [#4594](https://github.com/jundot/omlx/pull/4594) (the fork's own [#4709](https://github.com/jundot/omlx/pull/4709) was closed in its favor) |
+| The Claude Code auto-mode classifier request got thinking blocks it never asked for | The classifier was slow and its plain-text answer broke | none | Commit `f0e3f6a8` bounds thinking for the classifier request (the fork's own [#4714](https://github.com/jundot/omlx/pull/4714) was closed in its favor) |
 
 With the first two fixes, prefix-cache reuse on a 70K-token Claude Code session went from about 25–48% to 98–99.7% per turn.
 The measured numbers are in the comments on #4697 and #4701.
+Those numbers came from the fork's earlier versions of the fixes.
+We did not measure the upstream versions.
+
+The classifier fix differs from the fork's earlier one.
+The fork turned thinking off for the classifier.
+Upstream gives it a thinking budget instead.
 
 The fork also carries cluster fixes and a refactor that are open upstream or wait for a new pull request.
+The fork follows upstream for self-assigned (169.254) link addresses.
+We closed [#3205](https://github.com/jundot/omlx/pull/3205), which kept them as link candidates, until we can test a direct Thunderbolt cable setup.
 
 | Change | Upstream PR |
 | --- | --- |
 | Show the real reason tensor-parallel planning fails | [#3197](https://github.com/jundot/omlx/pull/3197) |
-| Keep a self-assigned Thunderbolt Bridge address as a link candidate | [#3205](https://github.com/jundot/omlx/pull/3205) |
 | Share Anthropic content-block text extraction, with property tests | [#3194](https://github.com/jundot/omlx/pull/3194) |
 | Send remote nodes an absolute model path | [#3196](https://github.com/jundot/omlx/pull/3196) was closed by the stale bot. Upstream `remote_model_dir` may already cover it. A check is pending. |
 | Stage safetensors shards from a subdirectory | Branch `fix/cluster-nested-shard-staging` is current. New pull request pending (replaces #3204). |
@@ -394,7 +401,7 @@ Claude Code's auto mode sends each tool call to a classifier model before it run
 A classifier request that thinks first is slow, and Claude Code cancels it after about a minute.
 The fork handles this in two ways.
 
-1. oMLX recognizes the classifier request by its system prompt and turns thinking off for it ([#3193](https://github.com/jundot/omlx/pull/3193)).
+1. oMLX recognizes the classifier request by its system prompt and bounds its thinking.
    An admin toggle can also route classifier requests to a chosen model tier.
 2. Claude Code 2.1.303 and later reads `CLAUDE_CODE_AUTO_MODE_MODEL` and sends the classifier to that model name.
    Point it at a model profile with thinking off.
