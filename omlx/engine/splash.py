@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Splash engine: serve a model through a Splash server process.
 
-Splash (https://github.com/incoai/splash) runs Qwen3.8-27B and
-Qwen3.6-35B-A3B on its own Metal engine with DFlash2 speculative decoding.
+Splash (https://github.com/incoai/splash) runs Qwen3.8-27B,
+Qwen3.6-35B-A3B and Qwen3.8-Flash-Next on its own Metal engine with DFlash2
+speculative decoding.
 It is a separate program, so this engine does not load weights in-process.
 ``start()`` stages the oMLX model folder as an entry of a private Hugging Face
 cache, launches ``splash serve --offline`` for it on a loopback port and
@@ -39,8 +40,9 @@ from typing import Any
 import httpx
 from transformers import AutoTokenizer
 
-from ..api.utils import _consolidate_system_messages, has_nonleading_system_message
+from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
+from ..gguf import SPLIT_VARIANT
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
 from .base import BaseEngine, GenerationOutput
@@ -77,6 +79,8 @@ THINKING_BUDGET_VERSION = (1, 3, 2)
 STATE_FORMAT_VERSION = (1, 3, 2)
 # Splash loads Model Optimizer and compressed-tensors NVFP4/FP8 from 1.3.2 on.
 NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
+FLASH_NEXT_VERSION = (1, 4, 0)
+SPLIT_GGUF_VERSION = (1, 4, 0)
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
 SPLASH_MAX_CONTEXT = 262144
@@ -116,12 +120,30 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
         "num_experts": 256,
         "num_experts_per_tok": 8,
     },
+    "Qwen3.8-Flash-Next": {
+        "model_type": "qwen4_exp_text",
+        "max_position_embeddings": 262144,
+        "hidden_size": 2560,
+        "num_hidden_layers": 48,
+        "vocab_size": 248320,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+    },
 }
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+_SHARD_INDEX = "model.safetensors.index.json"
+# Splash serves vision only with one of these from the target repository.
+_PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+# The one image normalization Splash runs ([-1, 1]), which both families use.
+_SPLASH_IMAGE_NORM = [0.5, 0.5, 0.5]
 # The DFlash2 draft Splash pairs with each family (its install/families.py).
 SPLASH_DRAFT_REPOS = {
     "Qwen3.8-27B": "incoai/Qwen3.8-27B-DFlash2",
     "Qwen3.6-35B-A3B": "incoai/Qwen3.6-35B-A3B-DFlash2",
+    "Qwen3.8-Flash-Next": "incoai/Qwen3.8-Flash-Next-DFlash2",
 }
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
@@ -295,13 +317,16 @@ def _read_json_cached(path: str, _mtime_ns: int) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _read_config(model_path: Path) -> dict | None:
-    path = model_path / "config.json"
+def _read_json(path: Path) -> dict | None:
     try:
         mtime = path.stat().st_mtime_ns
     except OSError:
         return None
     return _read_json_cached(str(path), mtime)
+
+
+def _read_config(model_path: Path) -> dict | None:
+    return _read_json(model_path / "config.json")
 
 
 def splash_family(config: dict) -> str | None:
@@ -424,10 +449,18 @@ def _check_model(
     if family is None:
         return f"Splash serves {' and '.join(SPLASH_FAMILIES)} only"
     source = _gguf_source(config)
+    if family == "Qwen3.8-Flash-Next":
+        if binary.version_tuple < FLASH_NEXT_VERSION:
+            return "Qwen3.8-Flash-Next needs Splash 1.4.0 or later"
+        if source is None:
+            return "Qwen3.8-Flash-Next needs a GGUF; Splash cannot load its MLX checkpoints"
     if source is not None:
         # Splash checks a GGUF's tensor types itself when it loads the file.
-        if len(source.get("parts") or []) > 1:
-            return "Splash serves single-file GGUFs only"
+        if (
+            len(source.get("parts") or []) > 1
+            and binary.version_tuple < SPLIT_GGUF_VERSION
+        ):
+            return "Split GGUFs need Splash 1.4.0 or later"
     else:
         problem = _quantization_problem(config, binary)
         if problem:
@@ -487,6 +520,24 @@ def _safetensors_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.glob("*.safetensors"))
 
 
+def _nested_shards(model_path: Path) -> list[str]:
+    """Shards the index keeps in a subdirectory, as OptiQ does its vision
+    tower (``optiq/optiq_vision.safetensors``), that are on disk."""
+    weight_map = (_read_json(model_path / _SHARD_INDEX) or {}).get("weight_map")
+    if not isinstance(weight_map, dict):
+        return []
+    names = {name for name in weight_map.values() if isinstance(name, str)}
+    # Plain relative paths only: Splash refuses the others by name.
+    return sorted(
+        name
+        for name in names
+        if "/" in name
+        and not name.startswith("/")
+        and ".." not in name.split("/")
+        and (model_path / name).is_file()
+    )
+
+
 def _gguf_source(config: dict) -> dict | None:
     """The GGUF a generated model folder links to (omlx/gguf.py), or None."""
     source = config.get("omlx_gguf")
@@ -510,7 +561,8 @@ def _weight_bytes(path: Path) -> int:
     file and the projector Splash pairs it with."""
     source = _gguf_source(_read_config(path) or {})
     if source is None:
-        return _safetensors_bytes(path)
+        nested = sum((path / name).stat().st_size for name in _nested_shards(path))
+        return _safetensors_bytes(path) + nested
     projectors = sorted(source.get("projectors") or [], key=_splash_projector_rank)
     names = [*(source.get("parts") or []), *projectors[:1]]
     return sum((path / name).stat().st_size for name in names)
@@ -575,13 +627,56 @@ def _model_files(model_path: Path) -> list[Path]:
     return sorted(files)
 
 
-def _snapshot_revision(model_path: Path, files: list[Path]) -> str:
-    """A 40-hex revision that changes whenever the model files change."""
+def _snapshot_additions(model_path: Path) -> dict[str, Path | bytes]:
+    """Snapshot entries Splash needs beyond the model files, by name: a file
+    to link, or the bytes to write.
+
+    - Splash takes index shards at the snapshot root only. A shard the index
+      keeps in a subdirectory gets a root link, and the index names the link.
+    - A vision checkpoint without a processor file gets one with the
+      preprocessing Splash runs. Patch and merge sizes come from the vision
+      config, so Splash still refuses a tower it cannot prepare images for.
+    """
+    additions: dict[str, Path | bytes] = {}
+    nested = _nested_shards(model_path)
+    if nested:
+        index = _read_json(model_path / _SHARD_INDEX)
+        flat = {name: name.replace("/", "-") for name in nested}
+        additions.update({flat[name]: model_path / name for name in nested})
+        weight_map = {
+            key: flat.get(name, name) for key, name in index["weight_map"].items()
+        }
+        index = {**index, "weight_map": weight_map}
+        additions[_SHARD_INDEX] = json.dumps(index, indent=2).encode()
+    config = _read_config(model_path) or {}
+    if splash_has_vision(config) and not any(
+        (model_path / name).is_file() for name in _PROCESSOR_FILES
+    ):
+        vision = config["vision_config"]
+        processor = {
+            "patch_size": vision.get("patch_size"),
+            "temporal_patch_size": vision.get("temporal_patch_size"),
+            "merge_size": vision.get("spatial_merge_size"),
+            "image_mean": _SPLASH_IMAGE_NORM,
+            "image_std": _SPLASH_IMAGE_NORM,
+        }
+        additions["preprocessor_config.json"] = json.dumps(processor).encode()
+    return additions
+
+
+def _snapshot_revision(
+    model_path: Path, files: list[Path], additions: dict[str, Path | bytes]
+) -> str:
+    """A 40-hex revision that changes whenever the model files or the
+    snapshot additions change."""
     digest = hashlib.sha1(str(model_path.resolve()).encode())
     for path in files:
         stat = path.stat()
         relative = path.relative_to(model_path)
         digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    for name, source in sorted(additions.items()):
+        data = source if isinstance(source, bytes) else str(source).encode()
+        digest.update(name.encode() + b"\0" + data + b"\n")
     return digest.hexdigest()
 
 
@@ -589,15 +684,17 @@ def stage_model(model_path: Path, repo_id: str, hub_dir: Path) -> Path:
     """Present ``model_path`` to Splash as a cached snapshot of ``repo_id``.
 
     Builds ``<hub_dir>/models--<owner>--<repo>/snapshots/<rev>`` from
-    symlinks to the model files and points ``refs/main`` at it, which is
-    what an offline Splash resolves. A link that resolves into a Hub cache
-    ``blobs/`` file spares Splash hashing that file.
+    symlinks to the model files and the additions Splash needs
+    (_snapshot_additions), and points ``refs/main`` at it, which is what an
+    offline Splash resolves. A link that resolves into a Hub cache ``blobs/``
+    file spares Splash hashing that file.
 
     Returns:
         The snapshot directory.
     """
     files = _model_files(model_path)
-    revision = _snapshot_revision(model_path, files)
+    additions = _snapshot_additions(model_path)
+    revision = _snapshot_revision(model_path, files, additions)
     repo_dir = hub_dir / ("models--" + repo_id.replace("/", "--"))
     snapshots = repo_dir / "snapshots"
     snapshot = snapshots / revision
@@ -608,6 +705,14 @@ def stage_model(model_path: Path, repo_id: str, hub_dir: Path) -> Path:
             link = partial / path.relative_to(model_path)
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(path.resolve())
+        for name, source in additions.items():
+            entry = partial / name
+            if isinstance(source, bytes):
+                # Replace the link: writing through it changes the model file.
+                entry.unlink(missing_ok=True)
+                entry.write_bytes(source)
+            else:
+                entry.symlink_to(source.resolve())
         partial.rename(snapshot)
     for stale in snapshots.iterdir():
         if stale.name != revision:
@@ -631,22 +736,6 @@ def splash_effort(chat_template_kwargs: dict | None) -> str | None:
     effort = str(effort).lower()
     effort = _EFFORT_ALIASES.get(effort, effort)
     return effort if effort in _SPLASH_EFFORTS else None
-
-
-def splash_preserve_thinking(chat_template_kwargs: dict | None) -> bool | None:
-    """The bool Splash accepts for preserve_thinking, or None to leave it unset.
-
-    Splash answers HTTP 400 to any other type, so a stray value is dropped
-    with a warning and Splash applies its own default.
-    """
-    preserve = (chat_template_kwargs or {}).get("preserve_thinking")
-    if preserve is not None and not isinstance(preserve, bool):
-        logger.warning(
-            "Splash: ignoring preserve_thinking %r; Splash accepts a bool only",
-            preserve,
-        )
-        return None
-    return preserve
 
 
 def splash_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -970,7 +1059,6 @@ class SplashEngine(BaseEngine):
         self._tokenizer: Any = None
         self._model_type: str | None = None
         self._status: dict[str, Any] | None = None
-        self._unknown_later_system: set[str] = set()
         self._status_task: asyncio.Task | None = None
         self._status_refresh: asyncio.Task | None = None
         self._vision = splash_has_vision(_read_config(self._path) or {})
@@ -1045,11 +1133,15 @@ class SplashEngine(BaseEngine):
 
     def _serve_command(self, port: int) -> list[str]:
         options = self._options
+        model = self._repo_id
+        source = _gguf_source(_read_config(self._path) or {}) or {}
+        if len(source.get("parts") or []) > 1:
+            model += f":{SPLIT_VARIANT}"
         command = [
             str(self._target.binary.path),
             "serve",
             "--model",
-            self._repo_id,
+            model,
             "--offline",
             "--draft-model",
             str(self._target.draft_path.resolve()),
@@ -1065,6 +1157,8 @@ class SplashEngine(BaseEngine):
             "--kv-format",
             options.kv_format,
         ]
+        if model != self._repo_id:
+            command += ["--served-model-name", self._repo_id]
         if not self._vision:
             # Text-only checkpoint: skip Splash's vision preparation.
             command.append("--language-only")
@@ -1151,46 +1245,15 @@ class SplashEngine(BaseEngine):
         except Exception:
             logger.debug("Splash: failed to fetch /status", exc_info=True)
             return
-        if isinstance(data, dict):
-            self._status = data
-            self._apply_later_system_capability(data)
-
-    def _apply_later_system_capability(self, status: dict[str, Any]) -> None:
-        """Tell request preparation whether Splash renders later system messages.
-
-        Splash renders a later system message in place when its chat template
-        allows it (natively or after its own patch), so oMLX must not fold it
-        into the leading system block (#4697). An unsupported template makes
-        Splash reject the request, so oMLX keeps folding.
-        """
-        if self._tokenizer is None:
+        if not isinstance(data, dict):
             return
-        chat_template = status.get("chat_template")
-        later_system = (
-            chat_template.get("later_system")
-            if isinstance(chat_template, dict)
-            else None
-        )
-        supported = None
-        if isinstance(later_system, str):
-            supported = _LATER_SYSTEM_SUPPORT.get(later_system)
-        # repr() because a malformed status can carry an unhashable value.
-        unknown = repr(later_system)
-        if (
-            later_system is not None
-            and supported is None
-            and unknown not in self._unknown_later_system
-        ):
-            self._unknown_later_system.add(unknown)
-            logger.warning(
-                "Splash: unknown chat_template.later_system %r for %s; "
-                "later system messages are folded into the first one",
-                later_system,
-                self.model_name,
+        self._status = data
+        later = (data.get("chat_template") or {}).get("later_system")
+        if self._tokenizer is not None:
+            # Named templates report a dict, which leaves the local probe in charge.
+            self._tokenizer._omlx_supports_mid_system_messages = (
+                _LATER_SYSTEM_SUPPORT.get(later) if isinstance(later, str) else None
             )
-        # None leaves the decision to the local template probe, the behaviour
-        # before this field existed.
-        self._tokenizer._omlx_supports_mid_system_messages = supported
 
     async def _poll_status(self) -> None:
         while True:
@@ -1279,11 +1342,6 @@ class SplashEngine(BaseEngine):
         budget = kwargs.get("thinking_budget")
         if budget is not None and self._target.binary.accepts_thinking_budget:
             body["thinking_token_budget"] = budget
-        # Splash renders the chat template itself and reads this one template
-        # option only as a top-level field.
-        preserve = splash_preserve_thinking(kwargs.get("chat_template_kwargs"))
-        if preserve is not None:
-            body["preserve_thinking"] = preserve
         return body
 
     async def _stream(
@@ -1415,23 +1473,29 @@ class SplashEngine(BaseEngine):
         body["messages"] = splash_messages(messages)
         if tools:
             body["tools"] = tools
-        effort = splash_effort(kwargs.get("chat_template_kwargs"))
+        template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        effort = splash_effort(template_kwargs)
         if effort:
             body["reasoning_effort"] = effort
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless this is set, so every new user turn would miss the
+        # prefix cache from the first stripped assistant turn onward.
+        preserve = template_kwargs.get("preserve_thinking")
+        if isinstance(preserve, bool):
+            body["preserve_thinking"] = preserve
         async for output in self._stream(body, kwargs.get("_request_id")):
             yield output
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_chat(messages, **kwargs))
 
-    def _template_token_count(
-        self, messages, tools, chat_template_kwargs
-    ) -> int | None:
-        """Token count of the rendered prompt, or None if the template fails."""
+    def count_chat_tokens(
+        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
+    ) -> int:
+        # The local template can reject a later system message that Splash
+        # renders in place; the folded form has the same text.
+        messages = _consolidate_system_messages(messages)
         template = dict(chat_template_kwargs or {})
-        if not isinstance(template.get("preserve_thinking", True), bool):
-            # Count the prompt Splash renders: it never receives this value.
-            del template["preserve_thinking"]
         attempts = (
             template,
             {k: v for k, v in template.items() if k != "reasoning_effort"},
@@ -1449,26 +1513,6 @@ class SplashEngine(BaseEngine):
                 return len(ids["input_ids"] if hasattr(ids, "keys") else ids)
             except Exception:  # an effort value this template rejects
                 logger.debug("Splash: chat template token count failed", exc_info=True)
-        return None
-
-    def count_chat_tokens(
-        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
-    ) -> int:
-        count = self._template_token_count(messages, tools, chat_template_kwargs)
-        if count is None and has_nonleading_system_message(messages):
-            # Splash renders a later system message in place even when this
-            # local copy of the template rejects it (#4697). Folding it into
-            # the leading block counts the same text plus its wrapper tokens.
-            count = self._template_token_count(
-                _consolidate_system_messages(messages), tools, chat_template_kwargs
-            )
-        if count is not None:
-            return count
-        logger.warning(
-            "Splash: chat template token count failed for %s; "
-            "counting message text only",
-            self.model_name,
-        )
         # Count the text only: an image's base64 payload is not prompt text.
         return sum(
             len(self._tokenizer.encode(_text_of(m.get("content")))) for m in messages

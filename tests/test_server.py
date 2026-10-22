@@ -1492,6 +1492,32 @@ def test_responses_reasoning_cache_policy(
 def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
     monkeypatch, model_type, thinking_type, expected
 ):
+    kwargs = _anthropic_preflight_kwargs(
+        monkeypatch,
+        {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": thinking_type},
+        },
+        model_type=model_type,
+    )
+    assert kwargs["chat_template_kwargs"] == expected
+
+
+def test_anthropic_auto_mode_classifier_gets_thinking_budget(monkeypatch):
+    body = {
+        "system": "You are a security monitor for autonomous AI coding agents.",
+        "messages": [{"role": "user", "content": "<transcript>ls</transcript>"}],
+    }
+    kwargs = _anthropic_preflight_kwargs(monkeypatch, body)
+    assert kwargs["thinking_budget"] == 256
+    assert "enable_thinking" not in (kwargs.get("chat_template_kwargs") or {})
+
+    kwargs = _anthropic_preflight_kwargs(monkeypatch, {**body, "stream": True})
+    assert "thinking_budget" not in kwargs
+
+
+def _anthropic_preflight_kwargs(monkeypatch, body, model_type="qwen3_5"):
+    """Return the kwargs /v1/messages hands to engine.preflight_chat."""
     engine = MagicMock()
     engine.model_type = model_type
     engine.is_diffusion_model = False
@@ -1518,16 +1544,10 @@ def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
     )
     with TestClient(srv.app, raise_server_exceptions=False) as client:
         response = client.post(
-            "/v1/messages",
-            json={
-                "model": "test-model",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "Hello"}],
-                "thinking": {"type": thinking_type},
-            },
+            "/v1/messages", json={"model": "test-model", "max_tokens": 64, **body}
         )
     assert response.status_code == 418, response.text
-    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected
+    return engine.preflight_chat.call_args.kwargs
 
 
 def _post_classifier_request(
@@ -1578,18 +1598,6 @@ def _post_classifier_request(
     return engine
 
 
-def test_anthropic_auto_mode_classifier_gets_thinking_disabled(monkeypatch, tmp_path):
-    engine = _post_classifier_request(
-        monkeypatch,
-        tmp_path,
-        lambda engine: AsyncMock(return_value=engine),
-        lambda name: None,
-    )
-
-    kwargs = engine.preflight_chat.call_args.kwargs["chat_template_kwargs"]
-    assert kwargs == {"enable_thinking": False}
-
-
 def test_anthropic_classifier_steering_serves_and_configures_the_tier_model(
     monkeypatch, tmp_path
 ):
@@ -1608,9 +1616,7 @@ def test_anthropic_classifier_steering_serves_and_configures_the_tier_model(
     )
 
     assert set(looked_up) == {"classifier-model"}
-    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == {
-        "enable_thinking": False
-    }
+    assert engine.preflight_chat.call_args.kwargs["thinking_budget"] == 256
 
 
 def test_anthropic_classifier_steering_falls_back_when_the_tier_model_is_missing(

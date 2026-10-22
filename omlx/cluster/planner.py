@@ -127,10 +127,15 @@ class ModelLayout:
     # Per-layer bytes a tensor-parallel rank reads from SSD instead of holding
     # (DeepSeek V4.1 Engram tables). Pipeline stages hold them. Empty means 0.
     tensor_parallel_ssd_layer_bytes: tuple[int, ...] = ()
+    # The Lightning MTP draft head. Ranks load it only when a plan enables MTP,
+    # and then only rank zero, which drafts. Absent from the layer bytes.
+    mtp_weight_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
             raise ValueError("fixed_weight_bytes must be non-negative")
+        if self.mtp_weight_bytes < 0:
+            raise ValueError("mtp_weight_bytes must be non-negative")
         if not self.layer_weight_bytes:
             raise ValueError("at least one layer is required")
         if len(self.layer_weight_bytes) > _MAX_PIPELINE_LAYERS:
@@ -222,6 +227,8 @@ class ModelLayout:
             payload["tensor_parallel_ssd_layer_bytes"] = list(
                 self.tensor_parallel_ssd_layer_bytes
             )
+        if self.mtp_weight_bytes:
+            payload["mtp_weight_bytes"] = self.mtp_weight_bytes
         return payload
 
     @classmethod
@@ -273,6 +280,7 @@ class ModelLayout:
                     int(value)
                     for value in payload.get("tensor_parallel_ssd_layer_bytes", ())
                 ),
+                mtp_weight_bytes=int(payload.get("mtp_weight_bytes", 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -858,6 +866,20 @@ def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
     return tuple(prefixes)
 
 
+def _cluster_mtp_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
+    """Weight prefixes of the draft head a registered rank module can load."""
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str):
+        return ()
+    prefixes = getattr(
+        sys.modules.get(f"mlx_lm.models.{model_type}"),
+        "CLUSTER_MTP_WEIGHT_PREFIXES",
+        (),
+    )
+    return tuple(prefixes)
+
+
 def _pipeline_stage_starts(config: dict[str, Any]) -> tuple[int, ...]:
     """Layers a later stage may start at, when the model's module restricts them."""
 
@@ -1210,12 +1232,14 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(f"model path is not a directory: {root}")
 
     fixed_bytes = 0
+    mtp_bytes = 0
     layer_sizes: dict[int, int] = {}
     ssd_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
     config = _model_config(root)
     unloaded = _VISION_WEIGHT_PREFIXES + _cluster_unloaded_prefixes(config)
+    mtp_prefixes = _cluster_mtp_prefixes(config)
     engram_names, engram_files = _engram_tables(config)
     weight_files, table_files = _model_weight_files(root, engram_files)
     for weight_file in (*weight_files, *table_files):
@@ -1246,6 +1270,8 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 raise PlanningError(f"invalid data offsets for tensor {name}")
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
+            if mtp_prefixes and name.startswith(mtp_prefixes):
+                mtp_bytes += offsets[1] - offsets[0]
             if name.startswith(unloaded):
                 # Ranks never load these, and vision_tower.blocks.N would
                 # otherwise be charged to decoder layer N.
@@ -1317,6 +1343,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if ssd_sizes
             else ()
         ),
+        mtp_weight_bytes=mtp_bytes,
     )
 
 
@@ -2126,6 +2153,7 @@ def _tp_stage_budget(
     *,
     fixed_weight_bytes: int,
     tensor_parallel_size: int,
+    head_rank_extra_bytes: int = 0,
 ) -> NodeBudget:
     """One synthetic budget standing in for a whole tensor-parallel stage.
 
@@ -2142,10 +2170,11 @@ def _tp_stage_budget(
     optimistic for TP stages.
     """
 
-    weakest = min(group, key=lambda node: node.usable_bytes)
-    stage_layer_capacity = tensor_parallel_size * (
-        weakest.usable_bytes - fixed_weight_bytes
+    weakest_usable = min(
+        node.usable_bytes - (head_rank_extra_bytes if node.rank == 0 else 0)
+        for node in group
     )
+    stage_layer_capacity = tensor_parallel_size * (weakest_usable - fixed_weight_bytes)
 
     performance = None
     if all(node.performance is not None for node in group):
@@ -2174,6 +2203,26 @@ def _tp_stage_budget(
     )
 
 
+def _with_head_on_last_layer(model: ModelLayout, head_bytes: int) -> ModelLayout:
+    layers = list(model.layer_weight_bytes)
+    layers[-1] += head_bytes
+    return replace(model, layer_weight_bytes=tuple(layers))
+
+
+def with_mtp_head(model: ModelLayout) -> ModelLayout:
+    """The layout of a pipeline plan that runs Lightning MTP.
+
+    Rank zero holds the last layers and is the only rank that drafts, so the
+    head is charged to the last layer: every split then lands it on rank zero.
+    """
+
+    if model.mtp_weight_bytes <= 0:
+        raise PlanningError(
+            "this checkpoint has no Lightning MTP head a cluster rank can load"
+        )
+    return _with_head_on_last_layer(model, model.mtp_weight_bytes)
+
+
 def plan_hybrid(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
@@ -2182,8 +2231,12 @@ def plan_hybrid(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    head_rank_extra_bytes: int = 0,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
+
+    ``head_rank_extra_bytes`` are weights only rank zero holds (an unsharded
+    Lightning MTP head).
 
     Combines contiguous pipeline stages with tensor-parallel weight sharding.
     The world is 2D: pipeline_stages * tensor_parallel_size == len(nodes).
@@ -2217,6 +2270,8 @@ def plan_hybrid(
         # abstraction at width one therefore produced a different layer cut
         # in autoconfigure than /deployments recomputed moments later. The
         # approval guard correctly refused that drift.
+        if head_rank_extra_bytes:
+            model = _with_head_on_last_layer(model, head_rank_extra_bytes)
         pipeline = plan_unequal_pipeline(
             model,
             nodes,
@@ -2256,7 +2311,8 @@ def plan_hybrid(
 
     # Validate fixed weights fit every node
     for node in nodes:
-        if model.fixed_weight_bytes > node.usable_bytes:
+        extra = head_rank_extra_bytes if node.rank == 0 else 0
+        if model.fixed_weight_bytes + extra > node.usable_bytes:
             raise PlanningError(
                 f"replicated fixed weights do not fit node {node.node_id}"
             )
@@ -2284,6 +2340,7 @@ def plan_hybrid(
             stage,
             fixed_weight_bytes=model.fixed_weight_bytes,
             tensor_parallel_size=tensor_parallel_size,
+            head_rank_extra_bytes=head_rank_extra_bytes,
         )
         for stage in partition_order
     )
@@ -2333,7 +2390,10 @@ def plan_hybrid(
         )
         for tp_rank, node in enumerate(group):
             held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)
-            planned = model.fixed_weight_bytes + held_layer_bytes + kv_bytes
+            fixed_bytes = model.fixed_weight_bytes + (
+                head_rank_extra_bytes if node.rank == 0 else 0
+            )
+            planned = fixed_bytes + held_layer_bytes + kv_bytes
             if planned > node.usable_bytes:
                 raise PlanningError(
                     f"hybrid shard does not fit node {node.node_id}: "
@@ -2353,7 +2413,7 @@ def plan_hybrid(
                     start_layer=start,
                     end_layer=end,
                     layer_weight_bytes=held_layer_bytes,
-                    fixed_weight_bytes=model.fixed_weight_bytes,
+                    fixed_weight_bytes=fixed_bytes,
                     reserve_bytes=node.reserve_bytes,
                     capacity_bytes=node.capacity_bytes,
                     manual_memory_limit=node.manual_memory_limit,
@@ -2369,7 +2429,7 @@ def plan_hybrid(
                         model,
                         node,
                         layer_count=end - start,
-                        weight_bytes=model.fixed_weight_bytes + held_layer_bytes,
+                        weight_bytes=fixed_bytes + held_layer_bytes,
                         tensor_parallel_size=tensor_parallel_size,
                     ),
                     sharded_weight_bytes=(
