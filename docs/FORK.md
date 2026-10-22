@@ -16,10 +16,8 @@ Scale the memory numbers if your Mac has less memory.
    On an M3 or later Mac, install the official Splash instead.
 3. Get the fork and create the Python environment ([steps 2 and 3](#2-get-the-fork)).
 4. Download the model and its draft model ([step 4](#4-download-the-models)).
-   The author runs `mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit`, a coding fine-tune of Qwen3.6-35B-A3B.
-   It uses the same draft model, `incoai/Qwen3.6-35B-A3B-DFlash2`, and the same Splash settings.
-   Download it the same way as the base model:
-   `.venv-service/bin/hf download mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit --local-dir ~/.omlx/models/mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit`.
+   The author runs `mlx-community/Qwen3.6-35B-A3B-4bit` with its draft model `incoai/Qwen3.6-35B-A3B-DFlash2`.
+   See [Which model to use](#which-model-to-use) for the reason.
 5. Start the server once, set an API key in the dashboard, and stop the server ([step 5](#5-start-the-server-once-by-hand)).
 6. Merge these values into `~/.omlx/settings.json`:
 
@@ -40,7 +38,7 @@ Scale the memory numbers if your Mac has less memory.
 7. Add this entry under `models` in `~/.omlx/model_settings.json`:
 
    ```json
-   "KAT-Coder-V2.5-Dev-OptiQ-4bit": {
+   "Qwen3.6-35B-A3B-4bit": {
      "external_engine": "splash",
      "max_context_window": 262144,
      "temperature": 0.6,
@@ -55,7 +53,7 @@ Scale the memory numbers if your Mac has less memory.
 8. Run the server under launchd ([step 7](#7-run-it-under-launchd)).
 9. Point Claude Code at it ([Use it with Claude Code](#use-it-with-claude-code)).
    Use the one model for the opus, sonnet and haiku slots.
-   Add the classifier profile for that model (the profile in the next section, under the name `KAT-Coder-V2.5-Dev-OptiQ-4bit`), and export `CLAUDE_CODE_AUTO_MODE_MODEL` as `KAT-Coder-V2.5-Dev-OptiQ-4bit:classifier`.
+   Add the classifier profile for that model (the profile in the next section, under the name `Qwen3.6-35B-A3B-4bit`), and export `CLAUDE_CODE_AUTO_MODE_MODEL` as `Qwen3.6-35B-A3B-4bit:classifier`.
 10. Check the cache ([Check the cache](#check-the-cache)).
 
 Three values in these files matter more than the rest.
@@ -72,32 +70,46 @@ The evidence behind these choices is in [`splash-moe-investigation.md`](splash-m
 
 ## Which model to use
 
-Use `KAT-Coder-V2.5-Dev-OptiQ-4bit`.
-It is a coding fine-tune of Qwen3.6-35B-A3B, so it runs on Splash with the same draft model and the same memory use (22 GB).
+Use `Qwen3.6-35B-A3B-4bit`, the base model.
+It runs on Splash with the `incoai/Qwen3.6-35B-A3B-DFlash2` draft model and needs 22 GB.
 Splash is the only engine here that keeps the prefix cache across turns, and prefill is most of the wait in an agent session.
 
-The choice rests on three measured facts. One fact is missing.
+The choice rests on one measurement: decode speed at long context.
+`KAT-Coder-V2.5-Dev-OptiQ-4bit` is a coding fine-tune of the same model, and it looked equal on a 31K-token bake-off prompt.
+In real Claude Code sessions it decoded at between a quarter and a little over half the speed of the base model once the context passed 40K tokens.
 
-- KAT-Coder called the tool on 17 of 17 runs of the bake-off prompt, the same as the base model.
-- Its replies are short: a median of 106 tokens, against 264–286 for the base model.
-  A shorter reply shortens a turn as much as faster decode does.
-- Its cold prefill (169 s) and warm time to first token (1.26 s) match the base model.
-- Answer quality is the missing fact, and it is not measured.
-  The published SWE-bench Verified score is 69.4 for KAT-Coder and 64.4 for the base model, from the vendor's own harness.
-  We did not verify it, and our benchmark does not test answer quality.
+These numbers come from the Splash logs of one M1 Max with 64 GB.
+Each figure is the median decode speed of requests that produced at least 100 tokens.
+The base model figures cover the first hours after we switched back to it.
 
-Decode speed does not separate the models.
-The same base model gave 18.6 and 38.0 tokens per second on one prompt, and heat is the likely cause.
-A gap smaller than 2 times between two models is within that swing.
+| Context | Base model | KAT-Coder | Requests (base, KAT-Coder) |
+| --- | --- | --- | --- |
+| 40–80K | 29.2 tok/s | 7.6 tok/s | 114, 11 |
+| 80–120K | 16.1 tok/s | 6.6 tok/s | 102, 36 |
+| 120–160K | 15.1 tok/s | 8.6 tok/s | 86, 15 |
+
+Both models averaged about 3.5 tokens per cycle, so the draft model matched both.
+Each cycle took longer on KAT-Coder.
+We do not know why. The OptiQ mixed-bit quantization is a possible cause, and we did not test it.
+
+Treat the numbers with care.
+
+- The runs were not controlled.
+  Concurrent requests and heat (Splash reported a thermal state of fair) change decode speed, and the two models did not run at the same times.
+- The KAT-Coder sample is small, at 137 completed requests in total.
+- We did not measure answer quality.
+  The published SWE-bench Verified score is 69.4 for KAT-Coder and 64.4 for the base model, from the vendor's own harness, and we did not verify it.
+- Tool calls worked on both models: 17 of 17 runs of the bake-off prompt.
+  KAT-Coder's replies were shorter (a median of 106 tokens against 264–286), but at long context that did not make up for the slower decode.
 
 ### Models that were rejected
 
 | Model | Result | Reason for rejection |
 | --- | --- | --- |
-| Qwen3.6-35B-A3B (base), Splash | Works, 17 of 17 tool calls | Not wrong. It is the fallback. Its replies are 2 to 3 times longer, and KAT-Coder is the same size and speed. |
+| `KAT-Coder-V2.5-Dev-OptiQ-4bit`, Splash | 17 of 17 tool calls, short replies, but a quarter to a little over half the base model's decode speed above 40K context | Too slow in real sessions. See the table above. |
 | Qwen3.8-27B (dense), Splash | 21 tokens per second decode, 92K-token prefill over 20 minutes | Too slow at prefill for 50K-token agent sessions. |
 | `DavidAU` Qwen3.8-27B NEO-CODER GGUF fine-tune, Splash | 2.1–2.7 tokens per second, and macOS aborted a GPU command after 12 minutes of prefill | About 8 times slower than stock Qwen3.8-27B. The draft model almost never matches this fine-tune, and Splash M1 did not test GGUF end to end. |
-| Nemotron-3.5-Lightning-30B-A3B 4-bit, oMLX MLX engine | 17 of 17 tool calls, 271 s cold prefill | It cannot use Splash, so it has no Splash cache work, and the fork changes do not touch that path. Prefill was about 115 tokens per second, against about 180 for Splash. |
+| Nemotron-3.5-Lightning-30B-A3B 4-bit, oMLX MLX engine | 17 of 17 tool calls, 271 s cold prefill | It cannot use Splash, so it has no Splash cache work, and the fork changes do not touch that path. Prefill was about 115 tokens per second, against about 180 for Splash. It is still the choice for a Mac with 36 GB. |
 | Qwen3.8-Flash-Next Q2_0 with MTP, `ds4` | 17 of 17 tool calls, fastest prefill (about 250 tokens per second) | It needs 43 GiB for a 131K context, so nothing else large fits. It is a 2-bit quant with unmeasured quality, and it is not served through oMLX. |
 | MiniCPM5-2B and Bonsai 2-bit | MiniCPM5-2B: 96 tokens per second on a short chat. Bonsai: 11 tokens per second. | Too small for the opus and sonnet slots, and a second resident model evicts the Qwen model (a reload takes about a minute). We deleted both. |
 
@@ -108,25 +120,26 @@ Qwen3.8 has no MoE model below 100B parameters, and gpt-oss-120b, Qwen3-Coder-Ne
 
 ### A Mac with 36 GB or less
 
-KAT-Coder is not bigger than the base model.
-Both use 22 GB, so the base model is not a smaller choice.
-Splash runs only Qwen3.8-27B and Qwen3.6-35B-A3B and their fine-tunes, so Splash has no model below this size.
-We did not test any model on a Mac with 36 GB.
+The base model needs 22 GB, and Splash has no model below that size.
+Splash runs only Qwen3.8-27B and Qwen3.6-35B-A3B and their fine-tunes.
+We did not test Splash on a Mac with 36 GB.
 
 - When the memory limit is too low for a full context window, Splash fits a shorter context, and oMLX reports that shorter limit.
   Below the memory for the weights and one request, Splash cannot start.
   See [`Splash.md`](Splash.md).
   Set the memory limit by hand, as in the quick start, and check `/v1/models` for the context that results.
-- The only measured model below 22 GB is Nemotron-3.5-Lightning-30B-A3B 4-bit on the oMLX MLX engine.
-  It uses 17 GB and called the tool on 17 of 17 runs.
-  It has no Splash prefix cache, and its cold prefill was about 115 tokens per second.
-  A cold 31K-token prompt took 271 s.
-  Expect slow turns after each cache miss.
+- Nemotron-3.5-Lightning-30B-A3B 4-bit on the oMLX MLX engine is the model we know works on a 36 GB Mac.
+  It uses about 18 GB resident, and we ran it on an M3 Pro with 36 GB.
+  A tool call through `/v1/messages` worked, and the classifier profile answered in 0.39 s.
+  The Mac swapped heavily (12.4 of 14.3 GB used) with other work open.
+  Do not raise `iogpu.wired_limit_mb`. Use the custom memory guard tier with a ceiling of 24 GB, because the other tiers set a ceiling from free memory that was too low for the model.
+  It has no Splash prefix cache, and on the M1 Max a cold 31K-token prompt took 271 s, so expect slow turns after each cache miss.
 - GLM-4.7-Flash (about 16 GB) and Qwen3-Coder-30B-A3B (about 17 GB) are the next candidates.
   They also run on the MLX engine without the Splash cache.
   We did not run them. Their sizes come from model listings, not from our tests.
 
-On this class of Mac, try KAT-Coder first with a short context, and move to Nemotron only if Splash fails to load.
+On this class of Mac, start with Nemotron on the MLX engine.
+Try the base model on Splash with a short context only if you want the prefix cache and accept the risk.
 
 ## Why the fork exists
 
