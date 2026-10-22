@@ -235,6 +235,40 @@ GGUF decode on M1 is also less tested: the Splash M1 release notes say GGUF mode
 We do not recommend this file.
 A dense 27B is also too slow at prefill for 50K-token agent sessions, as the stock model showed.
 
+### 10. Model bake-off on one long agent prompt
+
+The prompt is synthetic: a 1.5K-character system message, 12 tool definitions, and about 110K characters of repository text in the user message, followed by a request to run two scripts with the Bash tool.
+It is about 31K tokens (the exact count depends on the tokenizer).
+The script is `.tmp/bench_compare.py`, and it measures from the client, so it works the same against oMLX and `ds4`.
+Sampling was temperature 0.6 and top_p 0.95 for every model.
+Decode speed is output tokens divided by the full time minus the time of a 1-token request with the same prompt.
+
+| Model and engine | Cold prefill | Warm time to first token | Decode, 31K prompt | Decode, short prompt | Tool calls | Memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.6-35B-A3B, Splash (first run) | 173 s | 1.38 s | 18.6 tok/s | 27.1 tok/s | 17 of 17 | 22 GB |
+| Qwen3.6-35B-A3B, Splash (last run) | not run | 0.27 s | 38.0 tok/s | 58.8 tok/s | 16 of 16 | 22 GB |
+| KAT-Coder-V2.5-Dev OptiQ 4-bit, Splash | 169 s | 1.26 s | 18.4 tok/s | 37.8 tok/s | 17 of 17 | 22 GB |
+| Nemotron-3.5-Lightning-30B-A3B 4-bit, oMLX MLX engine | 271 s | 0.55 s | 25.3 tok/s | 30.3 tok/s | 17 of 17 | 17 GB |
+| Qwen3.8-Flash-Next Q2_0 with MTP, `ds4` | 124 s | 0.27 s | 28.2 tok/s | 33.9 tok/s | 17 of 17 | 43 GB |
+
+How to read it:
+
+- Every model called the tool on every run, so none showed the printed-command loop.
+- The decode column is not reliable.
+  The same 35B model, config and prompt gave 18.6 tok/s at 11:20 and 38.0 tok/s at 12:39.
+  The first run followed a long cold prefill, and the last run did not.
+  Heat from the prefill is the likely cause. We did not measure the GPU clock.
+  A decode gap smaller than 2 times between models in this table is within that swing.
+- Cold prefill is more stable.
+  `ds4` prefilled at about 250 tok/s, Splash at about 180 tok/s, and the oMLX MLX engine at about 115 tok/s.
+- Short-prompt replies differ in length.
+  The median reply was 106 tokens for KAT-Coder, 149 for Nemotron, 97 for `ds4`, and 264–286 for the 35B.
+  Fewer tokens per turn shortens a turn as much as faster decode does.
+- `ds4` needs 43 GiB of memory for its 131K context, so nothing else large fits beside it.
+  It runs a 2-bit quant, and we did not measure answer quality.
+- KAT-Coder reports SWE-bench Verified 69.4 against 64.4 for stock Qwen3.6-35B-A3B on its own harness.
+  We did not verify that, and this benchmark does not test answer quality.
+
 ## Plan
 
 Work in this order.
