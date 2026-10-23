@@ -100,8 +100,9 @@ A gap smaller than 2 times between two models is within that swing.
 | Nemotron-3.5-Lightning-30B-A3B 4-bit, oMLX MLX engine | 17 of 17 tool calls, 271 s cold prefill | It cannot use Splash, so it has no Splash cache work, and the fork changes do not touch that path. Prefill was about 115 tokens per second, against about 180 for Splash. |
 | Qwen3.8-Flash-Next Q2_0 with MTP, `ds4` | 17 of 17 tool calls, fastest prefill (about 250 tokens per second) | It needs 43 GiB for a 131K context, so nothing else large fits. It is a 2-bit quant with unmeasured quality, and it is not served through oMLX. |
 | MiniCPM5-2B and Bonsai 2-bit | MiniCPM5-2B: 96 tokens per second on a short chat. Bonsai: 11 tokens per second. | Too small for the opus and sonnet slots, and a second resident model evicts the Qwen model (a reload takes about a minute). We deleted both. |
+| gpt-oss-20b-MXFP4-Q4, oMLX MLX engine | Treated hook-injected text as user requests. Hallucinated tasks from the system prompt. Wrote tool calls into the harmony commentary channel with no recipient. | The commentary drop causes empty responses, and the hallucinated tasks loop forever. Too weak for the very large instruction sets Claude Code sends (131K context). |
 
-We have not tested GLM-4.7-Flash, Qwen3-Coder-30B-A3B or gpt-oss-20b.
+We have not tested GLM-4.7-Flash, Qwen3-Coder-30B-A3B, or Nemotron-3-Super.
 They fit in 48 GB, but they run in the MLX engine without the Splash cache.
 The plan to test them is in [`splash-moe-investigation.md`](splash-moe-investigation.md).
 Qwen3.8 has no MoE model below 100B parameters, and gpt-oss-120b, Qwen3-Coder-Next 80B and Nemotron 3 Super do not fit.
@@ -111,22 +112,37 @@ Qwen3.8 has no MoE model below 100B parameters, and gpt-oss-120b, Qwen3-Coder-Ne
 KAT-Coder is not bigger than the base model.
 Both use 22 GB, so the base model is not a smaller choice.
 Splash runs only Qwen3.8-27B and Qwen3.6-35B-A3B and their fine-tunes, so Splash has no model below this size.
-We did not test any model on a Mac with 36 GB.
+We tested the following on an M3 Pro (~36 GB) with a 30 GB memory guard.
 
-- When the memory limit is too low for a full context window, Splash fits a shorter context, and oMLX reports that shorter limit.
-  Below the memory for the weights and one request, Splash cannot start.
-  See [`Splash.md`](Splash.md).
-  Set the memory limit by hand, as in the quick start, and check `/v1/models` for the context that results.
-- The only measured model below 22 GB is Nemotron-3.5-Lightning-30B-A3B 4-bit on the oMLX MLX engine.
+- Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B (13.9 GB) runs on the oMLX MLX engine.
+  It called the tool on 17 of 17 runs of the bake-off prompt, with 12.6 tokens per second decode speed.
+  A classifier profile (`:classifier`) works: it returned "ok" in 1 token.
+  It does not use Splash, so it has no Splash prefix cache.
+  A cold 31K-token prompt prefills at about 100 tokens per second.
+  Expect slow turns after each cache miss.
+  This model fits on a 36 GB Mac with room for other apps.
+- gpt-oss-20b-MXFP4-Q4 (10.4 GB) failed on a 36 GB Mac.
+  It treated hook-injected text as user requests and hallucinated tasks from the system prompt.
+  It wrote tool calls into the harmony commentary channel with no recipient, which oMLX silently drops.
+  Too weak for the very large instruction sets Claude Code sends (131K context).
+  Do not use it.
+- Nemotron-3.5-Lightning-30B-A3B 4-bit on the oMLX MLX engine.
   It uses 17 GB and called the tool on 17 of 17 runs.
   It has no Splash prefix cache, and its cold prefill was about 115 tokens per second.
   A cold 31K-token prompt took 271 s.
   Expect slow turns after each cache miss.
-- GLM-4.7-Flash (about 16 GB) and Qwen3-Coder-30B-A3B (about 17 GB) are the next candidates.
-  They also run on the MLX engine without the Splash cache.
-  We did not run them. Their sizes come from model listings, not from our tests.
 
-On this class of Mac, try KAT-Coder first with a short context, and move to Nemotron only if Splash fails to load.
+When the memory limit is too low for a full context window, Splash fits a shorter context, and oMLX reports that shorter limit.
+Below the memory for the weights and one request, Splash cannot start.
+See [`Splash.md`](Splash.md).
+Set the memory limit by hand, as in the quick start, and check `/v1/models` for the context that results.
+GLM-4.7-Flash (about 16 GB) and Qwen3-Coder-30B-A3B (about 17 GB) are the next candidates.
+They also run on the MLX engine without the Splash cache.
+We did not run them. Their sizes come from model listings, not from our tests.
+
+On a 36 GB Mac, try Qwen3.6 REAP first.
+Move to Nemotron only if REAP is too slow.
+Do not use gpt-oss-20b.
 
 ## Why the fork exists
 
@@ -453,6 +469,69 @@ The first request after a restart is cold.
 A compaction in Claude Code also causes one cold turn.
 If `cached` stays low for no reason, send the log with an issue.
 
+### Environment variables
+
+The launcher scripts `~/bin/claude-lib.sh` and `~/bin/localclaude` set environment variables for oMLX and Claude Code.
+This section documents them for anyone who needs to reproduce the setup on another machine.
+
+#### Shared library (`claude-lib.sh`)
+
+| Variable | Value | Reason |
+| --- | --- | --- |
+| `API_TIMEOUT_MS` | 3000000 | Five-minute API timeout. Prevents cold prefill cancellations. |
+| `CLAUDE_STREAM_IDLE_TIMEOUT_MS` | 3000000 | Five-minute stream idle timeout. Same purpose. |
+| `CLAUDE_AUTO_BACKGROUND_TASKS` | 0 | No background tasks. The local model is too slow for them. |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 70 | Compact at 70% context usage. Frees memory before eviction. |
+| `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` | 1 | Always enable reasoning effort. |
+| `CLAUDE_CODE_ATTRIBUTION_HEADER` | 0 | No attribution header. Saves context tokens. |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | 1 | No telemetry. Reduces outbound calls. |
+| `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` | 1 | No feedback surveys. |
+| `CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING` | 1 | No file checkpointing. Saves disk and memory. |
+| `CLAUDE_CODE_ENABLE_AUTO_MODE` | 1 | Auto mode on. Sends tool calls through the classifier. |
+| `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` | 0 | No away summary. |
+| `CLAUDE_CODE_ENABLE_BACKGROUND_PLUGIN_REFRESH` | 0 | No background plugin refresh. |
+| `CLAUDE_CODE_MAX_RETRIES` | 3 | Maximum three retries per request. |
+| `CLAUDE_CODE_SYNC_PLUGIN_INSTALL` | 0 | No sync plugin install. |
+| `CLAUDE_CODE_SYNC_SKILLS` | 0 | No sync skills. |
+
+#### Launcher (`localclaude`)
+
+| Variable | Value | Reason |
+| --- | --- | --- |
+| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | 1 | Only one subagent at a time. Splash does not batch a second prefill with decode. |
+| `CLAUDE_CODE_AUTO_MODE_MODEL` | `Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B:classifier` | Classifier model. The `:classifier` suffix points to a profile with thinking off. |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 131072 | Context window for the REAP model. |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 131072 | Compact window. |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | 75 | Compact at 75% context usage. |
+| `OMLX_HAIKU_MODEL` | `Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B` | Haiku slot model. |
+| `OMLX_MAIN_MODEL` | `Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B` | Main slot model (opus/sonnet). |
+| `OMLX_FABLE_MODEL` | `Qwen3.6-35B-A3B-OptiQ-4bit-REAP-19B` | Fable slot model. |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | Same as OMLX_MAIN_MODEL | Subagent model. |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8000` | oMLX server URL. |
+| `ANTHROPIC_AUTH_TOKEN` | `<your oMLX API key>` | oMLX bearer token. Set in the dashboard. |
+| `ANTHROPIC_API_KEY` | (empty) | No external API key. |
+| `ANTHROPIC_DEFAULT_MODEL` | `sonnet` | Default model name. oMLX maps it to OMLX_MAIN_MODEL. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Same as OMLX_HAIKU_MODEL | Default haiku model. |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Same as OMLX_MAIN_MODEL | Default sonnet model. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Same as OMLX_MAIN_MODEL | Default opus model. |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Same as OMLX_FABLE_MODEL | Default fable model. |
+
+#### zsh colon-modifier gotcha
+
+zsh treats `$M:classifier` as a colon modifier and fails.
+The `:c` is read as a modifier flag.
+Use `${M}:classifier` or hardcode the model name string instead.
+This affects `CLAUDE_CODE_AUTO_MODE_MODEL` when it is set from a variable.
+
+#### harmony.py commentary channel drop bug
+
+oMLX's harmony adapter (`omlx/adapter/harmony.py`, line 513) silently drops tool calls that have no recipient because they were written to the commentary channel.
+gpt-oss-20b wrote tool calls into commentary.
+They were dropped.
+Claude Code received an empty response, and the Stop hook fired "no last_assistant_message".
+This is an open bug in oMLX.
+File it against the omlx repo.
+
 ## What to expect
 
 These numbers are from an M1 Max with 64 GB, Splash M1 1.3.2 and Qwen3.6-35B-A3B-4bit.
@@ -631,3 +710,7 @@ Settings, models and caches live in `~/.omlx`, so the release version uses them 
   It passes when run alone.
 - Splash returns HTTP 400 for a `preserve_thinking` value that is not a boolean.
   oMLX logs a warning and drops such a value.
+- oMLX harmony adapter drops tool calls written to the commentary channel.
+  The adapter at `omlx/adapter/harmony.py` (line 513) silently discards tool calls with no recipient.
+  gpt-oss-20b wrote tool calls into commentary, they were dropped, and Claude Code received an empty response.
+  This is an open bug in oMLX.
