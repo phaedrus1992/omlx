@@ -136,3 +136,22 @@ def test_text_from_content_blocks_skips_non_text_blocks():
 
 def test_text_from_content_blocks_returns_empty_for_no_blocks():
     assert _text_from_content_blocks([]) == []
+
+
+_TEXT = st.text(max_size=20)
+_TOOL_RESULT_ITEM = st.one_of(
+    _TEXT.map(lambda s: ("keep", s, s)),
+    _TEXT.map(lambda s: ("keep", s, {"type": "text", "text": s})),
+    _TEXT.map(lambda s: ("drop", s, {"type": "image", "text": s})),
+    st.integers().map(lambda n: ("drop", n, {"type": "text", "text": n})),
+)
+
+
+@given(st.lists(_TOOL_RESULT_ITEM, max_size=8))
+def test_tool_result_list_keeps_only_string_and_text_block_contents(items):
+    from omlx.api.anthropic_utils import _extract_tool_result_content
+
+    content = [raw for _kind, _value, raw in items]
+    expected = "\n".join(value for kind, value, _raw in items if kind == "keep")
+
+    assert _extract_tool_result_content(content) == expected

@@ -7811,6 +7811,7 @@ async def _prepare_anthropic_prompt(
     /v1/messages/count_tokens calls this too, so the count is taken on the
     prompt generation would see. settings_model names the model whose
     per-model settings apply, when it differs from request.model.
+    count_tokens does not steer, so it uses request.model.
     """
     settings_model = settings_model or request.model
     max_tool_result_tokens = None

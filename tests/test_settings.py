@@ -3171,6 +3171,34 @@ class TestClaudeCodeRouteIntegration:
         assert calls == ([action] if action else [])
         assert result["claude_desktop"].get("action") == action
 
+    def test_a_rejected_update_leaves_claude_code_settings_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {
+                "claude_code_steer_classifier_requests": True,
+                "claude_code_classifier_model_tier": "opus",
+                "splash_kv_format": "not-a-format",
+            }
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert caught.value.status_code == 400
+        assert gs.claude_code.steer_classifier_requests is False
+        assert gs.claude_code.classifier_model_tier == "haiku"
+
     def test_desktop_restore_endpoint_clears_toggle(self, tmp_path, monkeypatch):
         import asyncio
 

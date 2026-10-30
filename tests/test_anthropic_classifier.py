@@ -262,3 +262,22 @@ def test_is_auto_mode_classifier_request_requires_all_three_conditions(
     )
     expected = marker_present and not stream and not has_tools
     assert is_auto_mode_classifier_request(request) == expected
+
+
+def test_classifier_request_with_inline_system_message_is_matched():
+    """Claude Code 2.1.154+ can send the system prompt as a role=system message."""
+    payload = _classifier_payload()
+    payload.pop("system")
+    payload["messages"] = [
+        {"role": "system", "content": CLASSIFIER_SYSTEM},
+        *payload["messages"],
+    ]
+
+    assert is_auto_mode_classifier_request(_request(payload))
+
+
+def test_request_with_no_system_prompt_is_not_a_classifier_request():
+    payload = _classifier_payload()
+    payload.pop("system")
+
+    assert not is_auto_mode_classifier_request(_request(payload))

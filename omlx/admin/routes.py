@@ -4833,6 +4833,18 @@ async def update_global_settings(
                       400 if validation fails.
     """
     global_settings = _get_global_settings()
+    previous_claude_code = _snapshot_claude_code(global_settings.claude_code)
+    try:
+        return await _apply_global_settings_update(request)
+    except Exception:
+        # A rejected request must not leave the live Claude Code settings changed.
+        _restore_claude_code(global_settings.claude_code, previous_claude_code)
+        raise
+
+
+async def _apply_global_settings_update(request: GlobalSettingsRequest):
+    """Apply one settings update; the caller undoes Claude Code changes on error."""
+    global_settings = _get_global_settings()
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -5585,7 +5597,6 @@ async def update_global_settings(
             logger.info(msg)
 
     # Apply Claude Code settings (Live - immediately applied)
-    previous_claude_code = _snapshot_claude_code(global_settings.claude_code)
     claude_code_changed = False
     # mode: standard is-not-None check is correct — mode must never be null
     if request.claude_code_mode is not None:
@@ -5938,7 +5949,6 @@ async def update_global_settings(
     # Validate settings
     errors = global_settings.validate()
     if errors:
-        _restore_claude_code(global_settings.claude_code, previous_claude_code)
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
@@ -5953,7 +5963,6 @@ async def update_global_settings(
     try:
         await _save_global_settings_async(global_settings)
     except Exception as e:
-        _restore_claude_code(global_settings.claude_code, previous_claude_code)
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
