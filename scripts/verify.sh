@@ -9,7 +9,7 @@
 #   1. the native kernel binaries are not older than their source
 #   2. ruff lint on the lines the fork adds or changes (scripts/fork_lint.py)
 #   3. pytest with the upstream CI marker filter, less known M1 failures (#33)
-#   4. the web UI node tests from upstream CI
+#   4. the web UI node tests that upstream CI runs
 # Pytest runs with HOME and OMLX_BASE_PATH in a new temp dir. A test that
 # writes settings then cannot change the live ~/.omlx files.
 # Many tests use the GPU. Stop a live oMLX service before a run on the same Mac.
@@ -91,11 +91,15 @@ run_check pytest env HOME="$sandbox/home" OMLX_BASE_PATH="$sandbox/omlx" \
 	TMPDIR="$sandbox" "$python" -m pytest tests/ apps/omlx-web/tests \
 	apps/omlx-mac/Tests/python -m "not slow and not integration" -q \
 	${known_m1_failures[@]+"${known_m1_failures[@]}"}
-run_check node-ui node --test \
-	apps/omlx-web/tests/deepseek_v41_offload_ui.test.cjs \
-	apps/omlx-web/tests/hf_repo_id_ui.test.cjs \
-	apps/omlx-web/tests/moe_expert_offload_ui.test.cjs \
-	apps/omlx-web/tests/qwen_oq_a8_ui.test.cjs \
-	apps/omlx-web/tests/usage_history_ui.test.cjs
+# Upstream CI does not run these two, and a run of both did not finish in 2 minutes.
+node_skipped=(network_auth_ui ssd_cache_clear_ui)
+node_tests=()
+for test_file in apps/omlx-web/tests/*.test.cjs; do
+	name=$(basename "$test_file" .test.cjs)
+	if [[ " ${node_skipped[*]} " != *" $name "* ]]; then
+		node_tests+=("$test_file")
+	fi
+done
+run_check node-ui node --test "${node_tests[@]}"
 
 exit "$status"
