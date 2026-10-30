@@ -116,7 +116,9 @@ _any_block = st.one_of(_text_block, _tool_use_block)
 
 
 @given(st.lists(_any_block, max_size=10))
-def test_text_from_content_blocks_only_ever_returns_declared_text_block_contents(blocks):
+def test_text_from_content_blocks_only_ever_returns_declared_text_block_contents(
+    blocks,
+):
     """Whatever comes back is built only from blocks whose type == 'text'."""
     result = _text_from_content_blocks(blocks)
     expected = [b.text for b in blocks if isinstance(b, ContentBlockText)]

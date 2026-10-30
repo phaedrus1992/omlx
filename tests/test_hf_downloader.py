@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import fcntl
+import importlib
 import io
 import json
 import os
@@ -21,6 +22,7 @@ from fastapi import HTTPException
 from huggingface_hub import HfApi
 from huggingface_hub import constants as hub_constants
 from huggingface_hub import file_download as hub_file_download
+from huggingface_hub._local_folder import write_download_metadata
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
@@ -40,6 +42,11 @@ from omlx.admin.hf_downloader import (
     _sum_safetensors_blob_bytes,
 )
 from omlx.engine_pool import EnginePool
+
+# huggingface_hub 2.x sends requests through httpx2 instead of httpx.
+hub_httpx = importlib.import_module(
+    type(huggingface_hub.get_session()).__module__.partition(".")[0]
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1951,7 +1958,9 @@ class TestHFDownloaderRoutes:
             assert not (models_dir / "unsloth").exists()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("cached, aliased", [(False, False), (True, False), (False, True)])
+    @pytest.mark.parametrize(
+        "cached, aliased", [(False, False), (True, False), (False, True)]
+    )
     async def test_split_variant_delete_preserves_other_variants(
         self, tmp_path, write_gguf, cached, aliased
     ):
@@ -3185,11 +3194,12 @@ class TestSafetensorsBlobSize:
         def respond(request):
             requests.append(request)
             if reject_token and request.headers.get("authorization"):
-                return httpx.Response(401)
-            raise httpx.ReadTimeout("Hub stalled", request=request)
+                return hub_httpx.Response(401)
+            raise hub_httpx.ReadTimeout("Hub stalled", request=request)
 
         api = HfApi(token="test-token" if reject_token else False)
-        with httpx.Client(transport=httpx.MockTransport(respond)) as client, patch(
+        transport = hub_httpx.MockTransport(respond)
+        with hub_httpx.Client(transport=transport) as client, patch(
             "huggingface_hub.hf_api.get_session", return_value=client
         ), patch.object(hf_downloader_mod, "_HF_API_TIMEOUT", 0.1):
             for _ in range(2):
@@ -3628,6 +3638,37 @@ class TestRetryDownload:
             with pytest.raises(ValueError, match="not retryable"):
                 await downloader.retry_download(task.task_id)
 
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_refused_keeps_the_old_row(self, downloader, blocked_worker):
+        """A retry refused because the repo is already downloading must not
+        drop the failed or cancelled row it was asked to retry."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=blocked_worker.call,
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            old = DownloadTask(
+                task_id="t-old",
+                repo_id="owner/model",
+                status=DownloadStatus.CANCELLED,
+            )
+            downloader._tasks[old.task_id] = old
+            await downloader.start_download("owner/model")
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
+
+            with pytest.raises(ValueError, match="already in progress"):
+                await downloader.retry_download(old.task_id)
+
+            assert downloader._tasks.get(old.task_id) is old
             await downloader.shutdown()
 
     @pytest.mark.asyncio
@@ -4480,6 +4521,43 @@ class TestDownloadSpeed:
         assert observed > 0, "wire traffic must show while the disk is idle"
         assert task.speed_bps == 0.0  # terminal tasks publish 0
 
+    @pytest.mark.asyncio
+    async def test_block_allocation_ahead_of_writes_does_not_spike(
+        self, model_dir, monkeypatch
+    ):
+        """APFS can allocate a file's blocks well ahead of the bytes written:
+        the readout must follow the reported bytes, not the allocation."""
+        downloader, task = _downloading_task(
+            model_dir, task_id="t-alloc", total_size=10_000_000_000
+        )
+        state = {"logical": 0, "allocated": 0}
+
+        def scan(_path, _only=None):
+            state["logical"] += 100_000
+            state["allocated"] += 100_000_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["logical"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=1,
+                files={"payload": state["allocated"]},
+            )
+
+        with patch.object(downloader, "_get_download_activity", side_effect=scan):
+            poll = start_poll(monkeypatch, downloader, task, model_dir)
+            started_at, started_bytes = time.monotonic(), state["logical"]
+            observed = 0.0
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                observed = max(observed, task.speed_bps)
+            reported_bps = (state["logical"] - started_bytes) / (
+                time.monotonic() - started_at
+            )
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert 0 < observed < 2 * reported_bps
+
 # =============================================================================
 # Progress Reads Both Pipeline Stages (fetch = wire, reconstruction = disk)
 # =============================================================================
@@ -4760,6 +4838,188 @@ class TestRedownloadProgress:
             await _wait_for_downloads(downloader)
 
         assert list(polled["stale"]) == [str(target / "model.safetensors")]
+
+
+def _remote(name, size, etag, *, lfs=False):
+    return SimpleNamespace(
+        rfilename=name,
+        size=size,
+        blob_id=None if lfs else etag,
+        lfs=SimpleNamespace(sha256=etag) if lfs else None,
+    )
+
+
+class TestModelUpdates:
+    """A downloaded copy is compared with the repo by the etags hub recorded."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        repo_dir = tmp_path / "owner" / "model"
+        for name in ("config.json", "model.safetensors", "README.md", "tokenizer.json"):
+            _write(repo_dir / name, 100)
+        for name, etag in (
+            ("config.json", "c1"),
+            ("model.safetensors", "w1"),
+            ("README.md", "r1"),
+        ):
+            write_download_metadata(repo_dir, name, _OLD_COMMIT, etag)
+        return tmp_path
+
+    @staticmethod
+    def _describe(siblings, local_dir):
+        files = hf_downloader_mod._file_rows(siblings)
+        hf_downloader_mod._describe_repo_files(
+            files, local_dir, hf_downloader_mod._remote_etags(siblings)
+        )
+        return files, hf_downloader_mod._update_files(files, local_dir)
+
+    def test_changed_and_missing_required_files_are_the_update(self, model_dir):
+        repo_dir = model_dir / "owner" / "model"
+        _write(repo_dir / "generation_config.json", 100)
+        write_download_metadata(repo_dir, "generation_config.json", _OLD_COMMIT, "g1")
+        # Edited after download while the Hub copy stayed the same.
+        _write(repo_dir / "generation_config.json", 150)
+        edited = time.time() + 100
+        os.utime(repo_dir / "generation_config.json", (edited, edited))
+        siblings = [
+            _remote("config.json", 100, "c2"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+            _remote("generation_config.json", 100, "g1"),
+            _remote("README.md", 100, "r2"),
+            # No hub record: only the size shows the change.
+            _remote("tokenizer.json", 120, "t1", lfs=True),
+            _remote("chat_template.jinja", 10, "j1"),
+            _remote("LICENSE", 10, "l1"),
+        ]
+        files, update = self._describe(siblings, repo_dir)
+
+        assert {row["name"] for row in files if row["local"]} == {
+            "model.safetensors",
+            "generation_config.json",
+        }
+        assert {row["name"] for row in files if row["outdated"]} == {
+            "config.json",
+            "README.md",
+            "tokenizer.json",
+        }
+        assert set(update) == {
+            "config.json",
+            "README.md",
+            "tokenizer.json",
+            "chat_template.jinja",
+        }
+
+    def test_card_edit_fresh_or_unrecorded_folder_is_not_an_update(self, model_dir):
+        siblings = [
+            _remote("config.json", 100, "c1"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+            _remote("README.md", 100, "r2"),
+            _remote("tokenizer.json", 100, "t1", lfs=True),
+        ]
+        assert self._describe(siblings, model_dir / "owner" / "model")[1] == []
+        assert self._describe(siblings, model_dir / "owner" / "fresh")[1] == []
+
+        # Another tool's copy: a size change shows, but no update is offered.
+        copied = model_dir / "owner" / "copied"
+        shutil.copytree(model_dir / "owner" / "model", copied)
+        shutil.rmtree(copied / ".cache")
+        siblings[0] = _remote("config.json", 120, "c2")
+        files, update = self._describe(siblings, copied)
+        assert [row["name"] for row in files if row["outdated"]] == ["config.json"]
+        assert update == []
+
+    @pytest.mark.asyncio
+    async def test_check_updates_reports_changed_repos(self, model_dir):
+        for name in ("same", "busy", "broken", "plain"):
+            shutil.copytree(model_dir / "owner" / "model", model_dir / "owner" / name)
+        shutil.rmtree(model_dir / "owner" / "plain" / ".cache")
+        changed = [
+            _remote("config.json", 100, "c2"),
+            _remote("model.safetensors", 300, "w2", lfs=True),
+        ]
+        current = [
+            _remote("config.json", 100, "c1"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+        ]
+        hub = {"owner/model": changed, "owner/busy": changed, "owner/same": current}
+
+        def model_info(repo_id, **kwargs):
+            if repo_id == "owner/broken":
+                raise OSError("Hub unreachable")
+            return SimpleNamespace(siblings=hub[repo_id])
+
+        api = MagicMock()
+        api.model_info.side_effect = model_info
+        downloader = HFDownloader(model_dir=str(model_dir))
+        busy = DownloadTask(task_id="t", repo_id="Owner/Busy")
+        downloader._tasks[busy.task_id] = busy
+        with patch("omlx.admin.hf_downloader._get_hf_api", return_value=(api, None)):
+            result = await downloader.check_updates(
+                [
+                    "owner/model",
+                    "owner/same",
+                    "owner/busy",
+                    "owner/broken",
+                    "owner/plain",
+                    "owner/absent",
+                    "bad",
+                ],
+                token="tok",
+            )
+
+        assert result == {
+            "updates": {"owner/model": {"files": 2, "size": 400}},
+            "checked": 3,
+            "failed": ["owner/broken"],
+        }
+        assert {call.kwargs["token"] for call in api.model_info.call_args_list} == {
+            "tok"
+        }
+
+    @pytest.mark.asyncio
+    async def test_download_removes_files_the_repo_dropped(self, model_dir):
+        repo_dir = model_dir / "owner" / "model"
+        for name in ("model-00001-of-00002.safetensors", "helper.py"):
+            _write(repo_dir / name, 10)
+            write_download_metadata(repo_dir, name, _OLD_COMMIT, "e")
+        _write(repo_dir / "notes.txt", 10)
+        edited = time.time() + 100
+        os.utime(repo_dir / "helper.py", (edited, edited))
+
+        info = MagicMock()
+        info.sha = _NEW_COMMIT
+        info.safetensors = {"parameters": {"BF16": 10}}
+        info.siblings = [
+            _sibling("config.json", 10),
+            _sibling("model.safetensors", 10),
+        ]
+        api = MagicMock()
+        api.model_info.return_value = info
+        calls = []
+
+        def fake_snapshot_download(**kwargs):
+            calls.append(kwargs)
+            return [] if kwargs.get("dry_run") else None
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api", return_value=(api, None)
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            task = await downloader.start_download("owner/model")
+            await _wait_for_downloads(downloader)
+
+        assert task.status == DownloadStatus.COMPLETED
+        # The removal list and the payload come from the same commit.
+        assert [call["revision"] for call in calls] == [_NEW_COMMIT] * 2
+        records = repo_dir / ".cache" / "huggingface" / "download"
+        assert not (repo_dir / "model-00001-of-00002.safetensors").exists()
+        assert not (records / "model-00001-of-00002.safetensors.metadata").exists()
+        # Edited locally or never fetched by hub.
+        assert (repo_dir / "helper.py").exists()
+        assert (repo_dir / "notes.txt").exists()
 
 
 # =============================================================================
@@ -5116,3 +5376,26 @@ class TestFileSelection:
             assert row["group"] == "Q2_0/Flash-Next-Q2_0"
             assert row["mmproj"] == "mmproj-BF16.gguf"
         assert all(row["kind"] == "other" for row in files[2:6])
+
+    def test_variant_body_and_table_select_as_one_model(self):
+        names = [
+            f"Q4-PLE8/Qwen3.8-Flash-Next-UD-Q4_K_XL-{index:05d}-of-00005.gguf"
+            for index in range(1, 5)
+        ] + ["Q4-PLE8/Qwen3.8-Flash-Next-ple8-table-00005-of-00005.gguf"]
+        files = [{"name": name, "size": 1} for name in names + ["mmproj-BF16.gguf"]]
+
+        hf_downloader_mod._describe_repo_files(files, None)
+
+        assert {row["kind"] for row in files[:5]} == {"gguf"}
+        assert {row["group"] for row in files[:5]} == {
+            "Q4-PLE8/Qwen3.8-Flash-Next-UD-Q4_K_XL-Q4-PLE8"
+        }
+        assert {row["mmproj"] for row in files[:5]} == {"mmproj-BF16.gguf"}
+
+        # The task row names the model even when the table is listed first.
+        selected = [names[-1], "mmproj-BF16.gguf", *names[:-1]]
+        row = DownloadTask(task_id="t", repo_id="o/m", files=selected).to_dict()
+        assert row["gguf_files"] == [names[-1], *names[:-1]]
+        assert row["gguf_model_id"] == "Qwen3.8-Flash-Next-UD-Q4_K_XL-Q4-PLE8"
+        row = DownloadTask(task_id="t", repo_id="o/m", files=["Q-Q8_0.gguf"]).to_dict()
+        assert row["gguf_model_id"] == "Q-Q8_0"
