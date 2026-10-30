@@ -791,3 +791,21 @@ def test_without_an_abort_stage_the_timing_is_unchanged(tmp_path):
     # Two strikes (the failure tolerance) then the exit stage, no grace.
     assert ticks[0] == 2
     assert len(losses) == 1
+
+
+def test_read_remote_marker_error_is_never_empty(monkeypatch):
+    """Callers test the error for truthiness; a silent ssh failure must still
+    carry text."""
+    from omlx.cluster.liveness import read_remote_marker
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+
+    def silent_failure(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 255, "", "")
+
+    marker, _live, _peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/x.json", runner=silent_failure
+    )
+
+    assert marker is None
+    assert error == "ssh exited 255"

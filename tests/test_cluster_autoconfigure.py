@@ -1098,6 +1098,8 @@ def test_rdma_detection_does_not_ssh_to_itself(monkeypatch):
 
         class Result:
             stdout = "device node_GUID\n---- ----\nrdma_en6 abc123\n"
+            stderr = ""
+            returncode = 0
 
         return Result()
 

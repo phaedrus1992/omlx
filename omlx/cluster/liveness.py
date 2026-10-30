@@ -148,7 +148,15 @@ def probe_peer(
         timeout=timeout + 2,
         runner=runner,
     )
-    return getattr(result, "returncode", 1) == 0
+    alive = getattr(result, "returncode", 1) == 0
+    if not alive:
+        logger.warning(
+            "peer %s did not answer ssh (exit %s): %s",
+            ssh_target,
+            getattr(result, "returncode", None),
+            str(getattr(result, "stderr", "") or "").strip()[:200],
+        )
+    return alive
 
 
 def read_marker(path: Path) -> dict[str, Any] | None:
@@ -223,7 +231,9 @@ def read_remote_marker(
         error = getattr(result, "stderr", b"")
         if isinstance(error, bytes):
             error = error.decode(errors="replace")
-        return None, None, None, str(error).strip()
+        detail = str(error).strip()
+        # Callers test the error text for truthiness, so it must not be empty.
+        return None, None, None, detail or f"ssh exited {result.returncode}"
     raw = getattr(result, "stdout", b"")
     if isinstance(raw, str):
         raw = raw.encode()
