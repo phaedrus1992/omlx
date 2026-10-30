@@ -1078,7 +1078,7 @@ class TestRequestTranslation:
         assert "--decode-share" not in command
 
     def test_serve_command_keeps_decode_share_zero(self, tmp_path):
-        command = _engine(tmp_path, decode_share=0.0)._serve_command(9000)
+        command = _engine(tmp_path, version="1.3.2", decode_share=0.0)._serve_command(9000)
 
         assert command[command.index("--decode-share") + 1] == "0.0"
 
@@ -1091,6 +1091,15 @@ class TestRequestTranslation:
 
         assert "--state-format" not in command
         assert any("--state-format" in r.getMessage() for r in caplog.records)
+
+    def test_splash_before_1_3_2_gets_no_decode_share(self, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="omlx.engine.splash"):
+            command = _engine(
+                tmp_path, version="1.3.1", decode_share=1.0
+            )._serve_command(9000)
+
+        assert "--decode-share" not in command
+        assert any("--decode-share" in r.getMessage() for r in caplog.records)
 
     def test_serve_command_leaves_unset_limits_to_splash(self, tmp_path):
         command = _engine(tmp_path)._serve_command(9000)

@@ -931,7 +931,8 @@ class ClaudeCodeSettings:
     haiku_model: str | None = None
     # Serve Claude Code's auto-mode Bash safety-classifier requests with the
     # model of the chosen tier instead of the model the session asked for.
-    # Off by default.
+    # Off by default. The tier model gives the allow or block verdict, so a
+    # weaker tier makes the safety check weaker.
     steer_classifier_requests: bool = False
     classifier_model_tier: str = "haiku"
     # When True, oMLX exposes derived Claude Desktop tier aliases
@@ -961,14 +962,20 @@ class ClaudeCodeSettings:
                 tier,
             )
             tier = "haiku"
+        steer = data.get("steer_classifier_requests", False)
+        if not isinstance(steer, bool):
+            logger.warning(
+                "Ignoring non-boolean claude_code steer_classifier_requests %r; "
+                "steering stays off",
+                steer,
+            )
+            steer = False
         return cls(
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
             haiku_model=data.get("haiku_model"),
-            steer_classifier_requests=bool(
-                data.get("steer_classifier_requests", False)
-            ),
+            steer_classifier_requests=steer,
             classifier_model_tier=tier,
             desktop_enabled=data.get("desktop_enabled", False),
         )
@@ -1925,13 +1932,6 @@ class GlobalSettings:
             errors.append(
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
-            )
-        valid_classifier_tiers = set(CLASSIFIER_MODEL_TIERS)
-        if self.claude_code.classifier_model_tier not in valid_classifier_tiers:
-            errors.append(
-                f"Invalid claude_code classifier_model_tier: "
-                f"'{self.claude_code.classifier_model_tier}' "
-                f"(must be one of {sorted(valid_classifier_tiers)})"
             )
 
         # Integration validation

@@ -142,6 +142,7 @@ MIXED_QUANTIZATION_VERSION = (1, 3, 1)
 THINKING_BUDGET_VERSION = (1, 3, 2)
 # Splash stores recurrent states as bf16 with --state-format from 1.3.2 on.
 STATE_FORMAT_VERSION = (1, 3, 2)
+DECODE_SHARE_VERSION = (1, 3, 2)
 # Splash loads Model Optimizer and compressed-tensors NVFP4/FP8 from 1.3.2 on.
 NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
 FLASH_NEXT_VERSION = (1, 4, 0)
@@ -293,6 +294,10 @@ class SplashBinary:
     @property
     def accepts_state_format(self) -> bool:
         return self.version_tuple >= STATE_FORMAT_VERSION
+
+    @property
+    def accepts_decode_share(self) -> bool:
+        return self.version_tuple >= DECODE_SHARE_VERSION
 
     @property
     def loads_nvidia_quantization(self) -> bool:
@@ -1360,7 +1365,14 @@ class SplashEngine(BaseEngine):
                     options.state_format,
                 )
         if options.decode_share is not None:
-            command += ["--decode-share", str(options.decode_share)]
+            if self._target.binary.accepts_decode_share:
+                command += ["--decode-share", str(options.decode_share)]
+            else:
+                logger.warning(
+                    "Splash %s does not take --decode-share; ignoring it. "
+                    "Splash 1.3.2 or later takes it.",
+                    self._target.binary.version,
+                )
         if not options.ane_prefill:
             command.append("--disable-ane")
         if options.cache_disk_bytes > 0 and options.cache_dir is not None:

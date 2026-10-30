@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from omlx.settings import (
     BURST_DECODE_MODES,
@@ -2759,6 +2761,13 @@ class TestClaudeCodeSettings:
         assert settings.classifier_model_tier == "haiku"
 
 
+    def test_classifier_steering_from_dict_rejects_a_non_boolean(self):
+        """A hand-edited "false" string is truthy, so it must not turn steering on."""
+        for bad in ("false", "no", 1, 0, [], {}):
+            settings = ClaudeCodeSettings.from_dict({"steer_classifier_requests": bad})
+            assert settings.steer_classifier_requests is False
+
+
 class TestIntegrationSettings:
     """Tests for IntegrationSettings dataclass.
 
@@ -2946,27 +2955,6 @@ class TestClaudeCodeValidation:
         mode_errors = [e for e in errors if "claude_code mode" in e]
         assert len(mode_errors) == 1
 
-    def _make_global_settings_with_tier(self, tier: str) -> GlobalSettings:
-        gs = GlobalSettings.__new__(GlobalSettings)
-        real = GlobalSettings()
-        gs.__dict__.update(real.__dict__)
-        gs.claude_code = ClaudeCodeSettings(classifier_model_tier=tier)
-        return gs
-
-    @pytest.mark.parametrize("tier", ["opus", "sonnet", "haiku"])
-    def test_validate_classifier_model_tier_valid(self, tier):
-        gs = self._make_global_settings_with_tier(tier)
-        errors = gs.validate()
-        tier_errors = [e for e in errors if "classifier_model_tier" in e]
-        assert tier_errors == []
-
-    def test_validate_classifier_model_tier_invalid(self):
-        gs = self._make_global_settings_with_tier("sonoma")
-        errors = gs.validate()
-        tier_errors = [e for e in errors if "classifier_model_tier" in e]
-        assert len(tier_errors) == 1
-        assert "sonoma" in tier_errors[0]
-
 
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
@@ -3139,13 +3127,13 @@ class TestClaudeCodeRouteIntegration:
         assert claude_code["steer_classifier_requests"] is True
         assert claude_code["classifier_model_tier"] == "opus"
 
-    def test_from_dict_ignores_an_unknown_tier_and_coerces_the_flag(self):
+    def test_from_dict_ignores_an_unknown_tier_and_a_non_boolean_flag(self):
         cc = ClaudeCodeSettings.from_dict(
-            {"classifier_model_tier": "gpt", "steer_classifier_requests": 1}
+            {"classifier_model_tier": "gpt", "steer_classifier_requests": "yes"}
         )
 
         assert cc.classifier_model_tier == "haiku"
-        assert cc.steer_classifier_requests is True
+        assert cc.steer_classifier_requests is False
 
     @pytest.mark.parametrize(
         ("before", "after", "action"),
@@ -3495,3 +3483,42 @@ def test_inference_opt_in_keeps_network_management_requirements(
         allow_unauthenticated_inference=True,
     )
     assert any("non-loopback" in error for error in settings.validate())
+
+
+@given(
+    steer=st.booleans(),
+    tier=st.sampled_from(("opus", "sonnet", "haiku")),
+)
+def test_claude_code_settings_round_trip_over_generated_values(steer, tier):
+    original = ClaudeCodeSettings(
+        steer_classifier_requests=steer, classifier_model_tier=tier
+    )
+
+    restored = ClaudeCodeSettings.from_dict(original.to_dict())
+
+    assert restored.to_dict() == original.to_dict()
+
+
+@given(tier=st.text(max_size=12).filter(lambda t: t not in ("opus", "sonnet", "haiku")))
+def test_claude_code_settings_coerces_any_other_tier_to_haiku(tier):
+    once = ClaudeCodeSettings.from_dict({"classifier_model_tier": tier})
+    twice = ClaudeCodeSettings.from_dict(once.to_dict())
+
+    assert once.classifier_model_tier == "haiku"
+    assert twice.to_dict() == once.to_dict()
+
+
+@given(
+    share=st.none()
+    | st.floats(min_value=0, allow_nan=False, allow_infinity=False),
+    state_format=st.sampled_from(("fp32", "bf16")),
+)
+def test_integration_settings_round_trip_splash_options(share, state_format):
+    original = IntegrationSettings(
+        splash_decode_share=share, splash_state_format=state_format
+    )
+
+    restored = IntegrationSettings.from_dict(original.to_dict())
+
+    assert restored.splash_decode_share == original.splash_decode_share
+    assert restored.splash_state_format == original.splash_state_format

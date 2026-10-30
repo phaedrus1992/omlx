@@ -7755,9 +7755,9 @@ def _steered_classifier_model(is_classifier: bool) -> str | None:
     """Model id that should serve a classifier request, or ``None`` to leave
     the request on the model it asked for.
 
-    Off by default (``steer_classifier_requests``). Claude Code discards the
-    classifier's reply content, so the model that answers it does not need to
-    track the chat model.
+    Off by default (``steer_classifier_requests``). The classifier reply is
+    the allow or block verdict for an autonomous Bash command. A weaker tier
+    model lowers the quality of that safety check.
     """
     claude_code = getattr(_server_state.global_settings, "claude_code", None)
     if claude_code is None or not claude_code.steer_classifier_requests:
