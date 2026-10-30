@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import re
 import secrets
 import shlex
@@ -20,6 +21,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options, run_ssh_retrying
+
+logger = logging.getLogger(__name__)
 
 # Link speed thresholds for distinguishing TB4 from TB5
 _TB4_MAX_SPEED_GTBS = 40  # TB4 is up to 40 Gb/s
@@ -194,22 +197,11 @@ def _rdma_devices(ssh_hostname: str) -> list[str]:
     fails, and RDMA is reported as unavailable on hardware that has it — a
     false negative observed on a machine with rdma_en1/en2/en6 present.
 
-    Only the remote branch retries: a single dropped mDNS round trip for a
-    ``.local`` hostname must not read as "no RDMA", but a local machine with
-    no RDMA hardware fails ``ibv_devices`` deterministically every time, and
-    this probe runs on every activation-progress poll — retrying a call that
-    cannot succeed would add felt latency to every one of those polls.
+    Only the remote branch retries: see ``_read``.
     """
 
     if ssh_hostname in _LOCAL_HOSTS:
-        try:
-            result = subprocess.run(
-                ["ibv_devices"], capture_output=True, text=True, check=False, timeout=30
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(
-                f"RDMA device probe failed for {ssh_hostname}: {exc}"
-            ) from exc
+        result = run_ssh_retrying(["ibv_devices"], timeout=30, attempts=1)
     else:
         command = [
             "ssh",
@@ -1283,21 +1275,31 @@ def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
 def _read(ssh_hostname: str, command: list[str]) -> str:
     """Run one read-only command on a host, returning "" when it cannot run.
 
-    Retries a bounded few times on failure — see ``run_ssh_retrying`` for why:
-    a single dropped mDNS round trip for a ``.local`` hostname used to be
-    indistinguishable from "this host has no addresses".
+    A remote host is retried, because one dropped mDNS round trip for a
+    ``.local`` name must not read as "this host has no addresses". A local
+    command fails the same way every time, so it runs once. A remote failure
+    is logged, so an unreachable host does not look like an empty host.
     """
 
     argv = list(command)
-    if ssh_hostname not in _LOCAL_HOSTS:
+    local = ssh_hostname in _LOCAL_HOSTS
+    if not local:
         argv = [
             "ssh",
             *cluster_ssh_options(connect_timeout=10),
             ssh_hostname,
             *argv,
         ]
-    result = run_ssh_retrying(argv, timeout=30)
-    return result.stdout if result.returncode == 0 else ""
+    result = run_ssh_retrying(argv, timeout=30, attempts=1 if local else 3)
+    if result.returncode != 0 and not local:
+        logger.warning(
+            "cannot read %s on %s (exit %s): %s",
+            command[0],
+            ssh_hostname,
+            result.returncode,
+            str(result.stderr or "").strip()[:200],
+        )
+    return result.stdout or ""
 
 
 def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:

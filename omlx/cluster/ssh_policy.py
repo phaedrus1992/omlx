@@ -16,13 +16,18 @@ second implicit IP check behind it.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 _MANAGED_IDENTITY = "~/.ssh/omlx_cluster"
+# Pause between attempts. mDNS for a .local peer fails in short bursts.
+_RETRY_DELAY_SECONDS = 0.5
 
 
 def cluster_ssh_options(
@@ -92,28 +97,13 @@ def run_ssh_retrying(
     *,
     timeout: float,
     attempts: int = 3,
-    delay: float = 0.5,
     runner: Callable[..., Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one subprocess, retrying a bounded few times on failure.
+    """Run ssh or scp with bounded retries; OSError becomes returncode 255.
 
-    mDNS resolution for a ``.local`` peer is intermittently flaky — one
-    dropped multicast round trip should not be mistaken for a permanently
-    unreachable host. Every caller across this module's users is a read-only
-    remote query (interface/inventory/shard/layout/RDMA-device/heartbeat
-    probes), so retrying is always safe — even a peer that genuinely has no
-    marker yet just takes a little longer to be correctly reported that way,
-    rather than being misread as unreachable. An exception raised by
-    ``subprocess.run`` itself (the ``ssh``/``scp`` binary missing, say) is
-    folded into a failed ``CompletedProcess`` the same as a nonzero exit, so
-    callers only ever need to check ``returncode``.
-
-    ``runner`` defaults to the real ``subprocess.run``, resolved fresh on
-    every call rather than captured once as a default argument — a captured
-    default would keep pointing at the original function object even after a
-    test replaces ``subprocess.run``, silently reaching a real network call
-    instead of the test double. Pass ``runner`` explicitly for a seam the
-    liveness probes need to simulate a peer's SSH response.
+    A timeout is not retried, so one hung peer costs one ``timeout``. Pass
+    ``runner`` to inject a fake. The default is read at call time, so a test
+    can patch ``subprocess.run``.
     """
 
     run = runner if runner is not None else subprocess.run
@@ -124,10 +114,23 @@ def run_ssh_retrying(
             result = run(
                 argv, capture_output=True, text=True, check=False, timeout=timeout
             )
+        except subprocess.TimeoutExpired:
+            logger.debug("%s timed out after %ss", argv[:1], timeout)
+            return subprocess.CompletedProcess(
+                argv, 255, "", f"timed out after {timeout}s"
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             result = subprocess.CompletedProcess(argv, 255, "", str(exc))
         if result.returncode == 0:
             return result
+        logger.debug(
+            "attempt %d/%d of %s exited %s: %s",
+            attempt + 1,
+            attempts,
+            argv[:1],
+            result.returncode,
+            str(result.stderr or "").strip()[:200],
+        )
         if attempt < attempts - 1:
-            time.sleep(delay)
+            time.sleep(_RETRY_DELAY_SECONDS)
     return result

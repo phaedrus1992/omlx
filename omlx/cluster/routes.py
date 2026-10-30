@@ -121,6 +121,7 @@ from .staging import (
     fabric_transfer_address,
     home_relative_model_path,
     index_shards,
+    local_file_sizes,
     model_staging_inventory,
     plan_staging,
     remote_file_sizes,
@@ -1755,16 +1756,7 @@ def _run_staging_job(
             explicit_destination = deployment.path_map.get(host.node_id)
             if _local_ssh_target(host.ssh):
                 destination_dir = explicit_destination or str(model_path)
-                destination_path = Path(destination_dir)
-                present = (
-                {
-                    path.name: path.stat().st_size
-                    for path in destination_path.iterdir()
-                    if path.is_file()
-                }
-                    if destination_path.is_dir()
-                    else {}
-                )
+                present = local_file_sizes(destination_dir)
             else:
                 destination_dir = explicit_destination or remote_model_dir(
                     host.ssh, portable_model_path

@@ -249,7 +249,7 @@ def choose_parallelism(
 
     warnings: list[str] = []
     last_error: PlanningError | None = None
-    skipped_slow_transport: tuple[int, ...] = ()
+    slow_transport_degree: int | None = None
 
     for tensor_parallel_size in candidates:
         fast_enough = transports_are_fast_enough(
@@ -264,7 +264,8 @@ def choose_parallelism(
             and not fast_enough
             and not measured_on_this_path
         ):
-            skipped_slow_transport += (tensor_parallel_size,)
+            if slow_transport_degree is None:
+                slow_transport_degree = tensor_parallel_size
             continue
         try:
             plan = plan_hybrid(
@@ -340,15 +341,11 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
-    if skipped_slow_transport:
-        # Every remaining candidate satisfied the architecture's divisibility
-        # requirement — that is not why nothing ran. It was skipped because the
-        # detected link cannot carry tensor-parallel traffic, and 1 (pipeline,
-        # any link) was already filtered out of `candidates` before this loop
-        # for architectures without a pipeline forward path — see the
-        # ``not model.supports_pipeline`` filter above.
+    if slow_transport_degree is not None:
+        # The link is the reason, not divisibility: pipeline (degree 1) was
+        # already removed above for a model without a pipeline forward path.
         raise PlanningError(
-            f"tensor-parallel degree {skipped_slow_transport[0]} divides "
+            f"tensor-parallel degree {slow_transport_degree} divides "
             f"{len(nodes)} nodes across architecture dimensions "
             f"{model.tensor_parallel_divisors} cleanly, but the detected "
             f"link is not fast enough to carry tensor-parallel traffic, and "

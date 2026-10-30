@@ -33,7 +33,7 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -46,7 +46,6 @@ DONE = re.compile(
     r".*?TTFT ([\d.]+)s · ([\d.]+) tok/s"
 )
 CHARS_PER_TOKEN = 3.6
-EXTRA_TEMPLATE_KWARGS: dict = {}
 
 
 @dataclass
@@ -155,6 +154,12 @@ def prepare_base_path(path: Path, state_format: str | None, decode_share: float 
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True)
     settings = json.loads(BASE_SETTINGS.read_text())
+    for section in ("server", "integrations", "auth"):
+        if section not in settings:
+            raise RuntimeError(
+                f"{BASE_SETTINGS} has no '{section}' section. "
+                "Point BASE_SETTINGS at a complete oMLX settings.json."
+            )
     settings["server"]["port"] = 8100
     integrations = settings["integrations"]
     integrations.pop("splash_state_format", None)
@@ -172,12 +177,8 @@ def prepare_base_path(path: Path, state_format: str | None, decode_share: float 
 
 
 def start_server(executable: str, base_path: Path, port: int) -> subprocess.Popen:
-    if (
-        httpx.get(f"http://127.0.0.1:{port}/health", timeout=3).is_success
-        if _port_open(port)
-        else False
-    ):
-        raise RuntimeError(f"port {port} is already served; stop that server first")
+    if _port_open(port):
+        raise RuntimeError(f"port {port} is already in use; stop that server first")
     log = open(base_path / "server.out", "w")  # noqa: SIM115 - the child owns it
     if executable.endswith("python"):
         command = [
@@ -202,6 +203,7 @@ def _port_open(port: int) -> bool:
 
 def wait_healthy(port: int, process: subprocess.Popen, timeout: float = 300) -> None:
     deadline = time.time() + timeout
+    last_error = "no answer"
     while time.time() < deadline:
         if process.poll() is not None:
             raise RuntimeError("oMLX exited before it became healthy")
@@ -209,10 +211,13 @@ def wait_healthy(port: int, process: subprocess.Popen, timeout: float = 300) -> 
             health = httpx.get(f"http://127.0.0.1:{port}/health", timeout=3).json()
             if health.get("status") == "healthy":
                 return
-        except httpx.HTTPError:
-            pass
+            last_error = f"status {health.get('status')!r}"
+        except (httpx.HTTPError, ValueError) as error:
+            last_error = str(error)
         time.sleep(2)
-    raise TimeoutError("oMLX did not become healthy")
+    raise TimeoutError(
+        f"oMLX was not healthy after {timeout:.0f}s (last answer: {last_error})"
+    )
 
 
 class _Blocks:
@@ -254,15 +259,25 @@ class _Blocks:
             if block["type"] == "tool_use":
                 try:
                     block["input"] = json.loads(self.json_parts.get(index) or "{}")
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        f"tool_use block {index} carried invalid JSON: {error}"
+                    ) from error
             if block["type"] == "text" and not block["text"]:
                 continue
             content.append(block)
         return content
 
 
-def send_turn(client: httpx.Client, model: str, system, tools, messages, max_tokens):
+def send_turn(
+    client: httpx.Client,
+    model: str,
+    system,
+    tools,
+    messages,
+    max_tokens,
+    chat_template_kwargs: dict | None = None,
+):
     """Send one turn; return (TTFT, total seconds, the assistant's content)."""
     body = {
         "model": model,
@@ -274,8 +289,8 @@ def send_turn(client: httpx.Client, model: str, system, tools, messages, max_tok
         "thinking": {"type": "adaptive"},
         "messages": messages,
     }
-    if EXTRA_TEMPLATE_KWARGS:
-        body["chat_template_kwargs"] = EXTRA_TEMPLATE_KWARGS
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
     start = time.perf_counter()
     first = None
     blocks = _Blocks()
@@ -351,7 +366,15 @@ def run_session(arm: str, executable: str, repeat: int, args) -> Run:
                 while True:
                     try:
                         ttft, total, content = send_turn(
-                            client, args.model, system, tools, messages, args.max_tokens
+                            client,
+                            args.model,
+                            system,
+                            tools,
+                            messages,
+                            args.max_tokens,
+                            {"preserve_thinking": True}
+                            if args.preserve_thinking
+                            else None,
                         )
                         break
                     except (RuntimeError, httpx.HTTPError) as error:
@@ -380,7 +403,20 @@ def run_session(arm: str, executable: str, repeat: int, args) -> Run:
             process.kill()
     # oMLX sends a few warm-up requests when it loads the model; the session's
     # own requests are the last ones in the log.
-    seen_requests = splash_requests(base_path)[-len(run.turns) :]
+    all_requests = splash_requests(base_path)
+    if len(all_requests) < len(run.turns):
+        raise RuntimeError(
+            f"{arm} #{repeat}: Splash logged {len(all_requests)} requests for "
+            f"{len(run.turns)} turns. Check {base_path}/logs/splash."
+        )
+    if any(turn.retries for turn in run.turns):
+        # A retried turn can leave an extra Done line, which shifts the pairing.
+        print(
+            f"warning: {arm} #{repeat} retried a turn; Splash token counts "
+            "for earlier turns may be paired with the wrong request",
+            file=sys.stderr,
+        )
+    seen_requests = all_requests[-len(run.turns) :]
     for turn, seen in zip(run.turns, seen_requests, strict=True):
         turn.input_tokens, turn.cached_tokens = seen["input"], seen["cached"]
         turn.splash_ttft, turn.decode_tps = seen["ttft"], seen["tps"]
@@ -389,6 +425,12 @@ def run_session(arm: str, executable: str, repeat: int, args) -> Run:
 
 
 # -- report --------------------------------------------------------------------
+
+
+def _p90(values: list[float]) -> float:
+    if len(values) < 2:
+        return values[0]
+    return statistics.quantiles(values, n=10)[8]
 
 
 def summarize(runs: list[Run]) -> str:
@@ -401,11 +443,14 @@ def summarize(runs: list[Run]) -> str:
         sessions = [sum(t.client_total for t in r.turns) for r in runs if r.arm == arm]
         inputs = sum(t.input_tokens for t in later) or 1
         cached = sum(t.cached_tokens for t in later)
-        ttfts = sorted(t.client_ttft for t in later)
+        if not later:
+            rows.append(f"| {arm} | no turn after the first | | | | |")
+            continue
+        ttfts = [t.client_ttft for t in later]
         prefilled = sum(t.input_tokens - t.cached_tokens for t in later)
         rows.append(
             f"| {arm} | {100 * cached / inputs:.1f}% | {prefilled:,} "
-            f"| {statistics.median(ttfts):.1f}s | {ttfts[int(0.9 * len(ttfts)) - 1]:.1f}s "
+            f"| {statistics.median(ttfts):.1f}s | {_p90(ttfts):.1f}s "
             f"| {statistics.median(sessions) / 60:.1f} min |"
         )
     return "\n".join(rows)
@@ -468,23 +513,13 @@ def parse_args(argv):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    if args.preserve_thinking:
-        EXTRA_TEMPLATE_KWARGS["preserve_thinking"] = True
     runs = []
     for repeat in range(1, args.repeat + 1):
         for item in args.arm:
             name, _, executable = item.partition("=")
             print(f"== {name} run {repeat}", flush=True)
             runs.append(run_session(name, executable, repeat, args))
-            Path(args.out).write_text(
-                json.dumps(
-                    [
-                        r.__dict__ | {"turns": [t.__dict__ for t in r.turns]}
-                        for r in runs
-                    ],
-                    indent=2,
-                )
-            )
+            Path(args.out).write_text(json.dumps([asdict(r) for r in runs], indent=2))
     print(summarize(runs))
     return 0
 

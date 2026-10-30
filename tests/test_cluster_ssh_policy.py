@@ -137,3 +137,22 @@ def test_run_ssh_retrying_folds_a_raised_exception_into_the_result(monkeypatch):
 
     assert result.returncode != 0
     assert "no such file" in result.stderr
+
+
+def test_run_ssh_retrying_does_not_retry_a_timeout(monkeypatch):
+    """A hung peer costs one timeout, not one timeout per attempt."""
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_ssh_retrying(["ssh", "peer.local", "true"], timeout=5, attempts=3)
+
+    assert len(calls) == 1
+    assert result.returncode == 255
+    assert "timed out after 5" in result.stderr
