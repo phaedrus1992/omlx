@@ -11,13 +11,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from omlx.cluster.staging import (
     _REMOTE_FILE_SIZES_SNIPPET,
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
     _indexed_shards,
-    _local_file_sizes,
+    local_file_sizes,
     _validate_safe_relative_filename,
     fabric_transfer_address,
     index_shards,
@@ -413,7 +415,7 @@ def test_local_file_sizes_finds_a_one_level_nested_shard(tmp_path):
     (root / ".cache").mkdir()
     (root / ".cache" / "ignored").write_bytes(b"x")
 
-    sizes = _local_file_sizes(root)
+    sizes = local_file_sizes(root)
 
     assert sizes["model-00000.safetensors"] == 5
     assert sizes["optiq/optiq_vision.safetensors"] == 3
@@ -598,6 +600,7 @@ def test_remote_staging_pushes_weights_and_sidecars_to_the_named_node(
         plan,
         model_path=root,
         destination_host="studio.local",
+        destination_dir="/peer/models/m",
         sidecars=sidecar_files(root),
         transfer=fake_transfer,
         present_reader=lambda _host, _path: dict(landed),
@@ -635,6 +638,7 @@ def test_remote_staging_resumes_without_recopying_verified_files(
         plan,
         model_path=root,
         destination_host="studio.local",
+        destination_dir="/peer/models/m",
         sidecars=sidecar_files(root),
         transfer=lambda **_kwargs: pytest.fail("verified files must not be copied"),
         present_reader=lambda _host, _path: dict(landed),
@@ -1132,43 +1136,6 @@ def test_real_sftp_copies_literal_paths(
     assert sorted(p.name for p in destination.iterdir()) == [filename]
 
 
-def test_remote_staging_sends_the_tilde_form_when_destination_dir_is_omitted(
-    tmp_path,
-    monkeypatch,
-):
-    """stage_remote_files's destination_dir default must own the
-    ~-abbreviation for transit itself (#16 variant), matching
-    remote_model_dir's contract — a caller that omits destination_dir still
-    reaches the peer's own home instead of sending the coordinator's raw
-    absolute path, which names nothing on a cross-user peer."""
-    from omlx.cluster.staging import stage_remote_files
-
-    monkeypatch.setenv("HOME", str(tmp_path))
-    root = _model(tmp_path / "source", layers=2, per_file=2)
-    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
-    seen_paths = []
-    monkeypatch.setattr(
-        "omlx.cluster.staging.check_disk_for_staging",
-        lambda *args, **kwargs: 100 * 1024**3,
-    )
-
-    def present_reader(_host, path):
-        seen_paths.append(path)
-        return {}
-
-    stage_remote_files(
-        plan,
-        model_path=root,
-        destination_host="studio.local",
-        sidecars=sidecar_files(root),
-        transfer=lambda **_kwargs: None,
-        present_reader=present_reader,
-    )
-
-    assert seen_paths
-    assert all(path == "~/source" for path in seen_paths)
-
-
 def test_free_disk_bytes_quotes_the_remote_path(monkeypatch):
     """The peer-resolved model directory is interpolated into a remote shell
     command; an unquoted path with shell metacharacters would let a
@@ -1278,24 +1245,6 @@ def test_run_remote_python_gives_up_after_exhausting_retries(monkeypatch):
     assert len(calls) == 3
 
 
-def _add_nested_auxiliary_shard(root):
-    """OptiQ-style optiq/optiq_vision.safetensors, indexed but nested.
-
-    Its tensor names deliberately reuse "blocks.N" — the same naming a
-    decoder layer would use — to prove the nested file is never attributed
-    to a decoder layer by coincidence.
-    """
-
-    (root / "optiq").mkdir()
-    vision_tensors = [f"vision_tower.blocks.{i}.attn.qkv.weight" for i in range(3)]
-    _write_shard(root / "optiq", "optiq_vision.safetensors", vision_tensors)
-    index_path = root / "model.safetensors.index.json"
-    payload = json.loads(index_path.read_text())
-    for tensor in vision_tensors:
-        payload["weight_map"][tensor] = "optiq/optiq_vision.safetensors"
-    index_path.write_text(json.dumps(payload))
-
-
 def test_free_disk_bytes_keeps_a_home_relative_path_expandable(monkeypatch):
     """A ~-form path must still expand in the peer's home, with the rest of
     the path quoted as data."""
@@ -1323,3 +1272,94 @@ def test_free_disk_bytes_keeps_a_home_relative_path_expandable(monkeypatch):
         "tail",
         "-1",
     ]
+
+
+def test_stage_remote_files_pushes_a_nested_auxiliary_shard(tmp_path, monkeypatch):
+    from omlx.cluster.staging import local_file_sizes, stage_remote_files
+
+    root = _model(tmp_path / "source", layers=2, per_file=2, with_index=True)
+    _add_nested_auxiliary_shard(root)
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    pushed = []
+    landed = {}
+
+    def fake_transfer(*, filename, **_kwargs):
+        pushed.append(filename)
+        landed[filename] = local_file_sizes(root)[filename]
+
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+    result = stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        destination_dir="/peer/models/m",
+        sidecars=("optiq/optiq_vision.safetensors",),
+        transfer=fake_transfer,
+        present_reader=lambda _host, _path: dict(landed),
+    )
+
+    assert "optiq/optiq_vision.safetensors" in pushed
+    assert "optiq/optiq_vision.safetensors" in result.copied
+    assert not result.failed
+
+
+def test_stage_remote_files_rejects_a_name_missing_from_the_source(tmp_path):
+    from omlx.cluster.staging import stage_remote_files
+
+    root = _model(tmp_path / "source", layers=2, per_file=2, with_index=True)
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+
+    with pytest.raises(RuntimeError, match="optiq/optiq_vision.safetensors"):
+        stage_remote_files(
+            plan,
+            model_path=root,
+            destination_host="studio.local",
+            destination_dir="/peer/models/m",
+            sidecars=("optiq/optiq_vision.safetensors",),
+        )
+
+
+_PATH_TEXT = st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=40)
+
+
+@given(_PATH_TEXT)
+def test_safe_relative_filename_accepts_only_names_inside_the_model_root(name):
+    from pathlib import Path
+
+    from omlx.cluster.staging import (
+        _is_safe_relative_filename,
+        _validate_safe_relative_filename,
+    )
+
+    if not _is_safe_relative_filename(name):
+        with pytest.raises(ValueError):
+            _validate_safe_relative_filename(name)
+        return
+    _validate_safe_relative_filename(name)
+    parts = Path(name).parts
+    assert not Path(name).is_absolute()
+    assert 1 <= len(parts) <= 2
+    assert ".." not in parts
+    assert not any(part.startswith(".") for part in parts)
+    assert "\x00" not in name
+
+
+@given(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=40))
+def test_remote_shell_path_round_trips_through_a_shell(path):
+    import shlex
+
+    from omlx.cluster.staging import _remote_shell_path
+
+    tokens = shlex.split(_remote_shell_path(path))
+    assert tokens == [path]
+
+
+def test_safe_relative_filename_rejects_deep_hidden_and_nul_names():
+    from omlx.cluster.staging import _is_safe_relative_filename
+
+    assert _is_safe_relative_filename("optiq/optiq_vision.safetensors")
+    for bad in ("a/b/c.safetensors", ".cache/x.safetensors", "a\x00b", "/abs", "../x"):
+        assert not _is_safe_relative_filename(bad)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -33,37 +34,42 @@ from ..model_discovery import _VISION_WEIGHT_PREFIXES
 from .ssh_policy import cluster_ssh_options, run_ssh_retrying
 from .worker_shim import CLUSTER_PYTHON_SHIM
 
+logger = logging.getLogger(__name__)
+
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
-def _validate_safe_relative_filename(filename: str) -> None:
-    """Reject a path that escapes the model root or names an absolute location.
+def _is_safe_relative_filename(filename: str) -> bool:
+    """Whether ``filename`` stays inside the model root, at most one level deep.
 
-    A one-level subdirectory is legitimate — OptiQ VLM checkpoints index
-    ``optiq/optiq_vision.safetensors`` alongside the numbered decoder shards —
-    so only ``..`` traversal and absolute paths are refused, not every
-    filename with a ``/`` in it.
+    OptiQ VLM checkpoints index ``optiq/optiq_vision.safetensors`` next to the
+    flat decoder shards, so one subdirectory is allowed. An absolute path, a
+    ``..`` part, a hidden part, a NUL byte, or a deeper path is not.
     """
 
+    if "\x00" in filename:
+        return False
     path = Path(filename)
-    if path.is_absolute() or not path.parts or ".." in path.parts:
+    if path.is_absolute() or not path.parts or len(path.parts) > 2:
+        return False
+    return not any(part.startswith(".") for part in path.parts)
+
+
+def _validate_safe_relative_filename(filename: str) -> None:
+    """Raise ValueError unless ``_is_safe_relative_filename`` accepts ``filename``."""
+
+    if not _is_safe_relative_filename(filename):
         raise ValueError(f"unsafe filename: {filename!r}")
 
 
 def _is_auxiliary_shard(filename: str) -> bool:
     """Whether ``filename`` sits outside the flat, pipeline-splittable shard set.
 
-    Every decoder shard this module has ever staged lives flat in the model
-    root — that assumption is load-bearing throughout this file. A nested
-    path is therefore never a decoder shard by construction: it is an
-    auxiliary weight file the publisher deliberately separated out (e.g.
-    OptiQ's ``optiq/optiq_vision.safetensors``, a vision encoder). Its tensor
-    names cannot be trusted to carry a decoder layer index — a vision encoder
-    commonly reuses "blocks.N"/"layers.N" naming with its own, unrelated
-    numbering, so running it through ``_LAYER`` would attribute it to a
-    decoder layer by coincidence, not by fact.
+    A nested file is an auxiliary weight file, such as OptiQ's vision encoder.
+    Its tensor names reuse "blocks.N" naming with unrelated numbering, so
+    ``_LAYER`` must not attribute it to a decoder layer.
     """
 
     return len(Path(filename).parts) > 1
@@ -72,37 +78,6 @@ def _is_auxiliary_shard(filename: str) -> bool:
 # Every running oMLX installation publishes this interpreter shim. Keep the
 # peer-home form so the remote shell expands it for the authenticated user.
 DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
-
-
-def _validate_safe_relative_filename(filename: str) -> None:
-    """Reject a path that escapes the model root or names an absolute location.
-
-    A one-level subdirectory is legitimate — OptiQ VLM checkpoints index
-    ``optiq/optiq_vision.safetensors`` alongside the numbered decoder shards —
-    so only ``..`` traversal and absolute paths are refused, not every
-    filename with a ``/`` in it.
-    """
-
-    path = Path(filename)
-    if path.is_absolute() or not path.parts or ".." in path.parts:
-        raise ValueError(f"unsafe filename: {filename!r}")
-
-
-def _is_auxiliary_shard(filename: str) -> bool:
-    """Whether ``filename`` sits outside the flat, pipeline-splittable shard set.
-
-    Every decoder shard this module has ever staged lives flat in the model
-    root — that assumption is load-bearing throughout this file. A nested
-    path is therefore never a decoder shard by construction: it is an
-    auxiliary weight file the publisher deliberately separated out (e.g.
-    OptiQ's ``optiq/optiq_vision.safetensors``, a vision encoder). Its tensor
-    names cannot be trusted to carry a decoder layer index — a vision encoder
-    commonly reuses "blocks.N"/"layers.N" naming with its own, unrelated
-    numbering, so running it through ``_LAYER`` would attribute it to a
-    decoder layer by coincidence, not by fact.
-    """
-
-    return len(Path(filename).parts) > 1
 
 
 def is_local_host(host: str) -> bool:
@@ -214,13 +189,17 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
                 filename = str(filename)
                 _validate_safe_relative_filename(filename)
                 names_by_file.setdefault(filename, []).append(str(tensor))
-                # The index may reference an auxiliary file outside the flat
-                # top-level glob above — e.g. OptiQ's
-                # optiq/optiq_vision.safetensors. Pick it up here so it is
-                # promised for staging rather than silently dropped.
-                if filename not in file_names and (root / filename).is_file():
-                    files.append(root / filename)
-                    file_names.add(filename)
+                # An indexed nested file is outside the flat glob above.
+                if filename not in file_names:
+                    if (root / filename).is_file():
+                        files.append(root / filename)
+                        file_names.add(filename)
+                    else:
+                        logger.warning(
+                            "%s lists %s but the file is missing; it will not be staged",
+                            index,
+                            filename,
+                        )
 
     shards = []
     for path in files:
@@ -229,9 +208,6 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
         if names is None:
             names = _safetensors_tensor_names(path)
         if _is_auxiliary_shard(rel_name):
-            # See the matching comment in _indexed_shards: not part of the
-            # numbered decoder-shard set, so _LAYER below would attribute its
-            # tensor names to a decoder layer by coincidence, not by fact.
             shards.append(
                 ShardInfo(
                     name=rel_name,
@@ -342,14 +318,7 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     for filename, names in sorted(names_by_file.items()):
         path = root / filename
         if _is_auxiliary_shard(filename):
-            # An index entry outside the numbered decoder-shard set — e.g.
-            # OptiQ's optiq/optiq_vision.safetensors. model_discovery.py
-            # excludes these from completeness checks for the same reason
-            # (#2742): a vision encoder commonly reuses "blocks.N"/"layers.N"
-            # naming with its own unrelated numbering, so running its tensor
-            # names through _LAYER below would attribute them to a decoder
-            # layer by coincidence, not by fact. Ship the whole file to every
-            # rank instead, the same as any other non-layer-specific tensor.
+            # Ship it to every rank, like any shared tensor (#2742).
             shards.append(
                 ShardInfo(
                     name=filename,
@@ -655,11 +624,7 @@ def stage_manifest(
             destination = Path(
                 (path_map or {}).get(assignment.node_id, remote_dir)
             ).expanduser()
-            present_by_node[assignment.node_id] = {
-                path.name: path.stat().st_size
-                for path in (destination.iterdir() if destination.is_dir() else ())
-                if path.is_file()
-            }
+            present_by_node[assignment.node_id] = local_file_sizes(destination)
         else:
             peer_dir = remote_model_dir(
                 ssh_target, (path_map or {}).get(assignment.node_id, portable)
@@ -966,12 +931,10 @@ def scp_push(
             _discard_remote_staged_file(destination_host, temporary_path)
 
 
-def _local_file_sizes(model_dir: str | Path) -> dict[str, int]:
+def local_file_sizes(model_dir: str | Path) -> dict[str, int]:
     """Every model file's size, keyed by its path relative to ``model_dir``.
 
-    One level deep only — a safetensors index can reference an auxiliary
-    shard in a subdirectory (e.g. OptiQ's optiq/optiq_vision.safetensors),
-    but nothing in the staging contract needs more than that, and unbounded
+    One level deep only, as ``_is_safe_relative_filename`` allows. Deeper
     recursion would walk into .cache/huggingface's download bookkeeping.
     """
 
@@ -1068,7 +1031,7 @@ def scp_copy(
             if temporary.exists():
                 temporary.unlink()
     else:
-        remote_destination = shlex.quote(destination_dir)
+        remote_destination = _remote_shell_path(destination_dir)
         mkdir = subprocess.run(
             [
                 "ssh",
@@ -1200,7 +1163,7 @@ def stage_files_from_source(
         )
 
     present = (
-        _local_file_sizes(destination_dir)
+        local_file_sizes(destination_dir)
         if is_local_host(destination_host)
         else remote_file_sizes(destination_host, destination_dir)
     )
@@ -1263,7 +1226,7 @@ def stage_files_from_source(
                     progress(name, "copied", expected[name])
 
     landed = (
-        _local_file_sizes(destination_dir)
+        local_file_sizes(destination_dir)
         if is_local_host(destination_host)
         else remote_file_sizes(destination_host, destination_dir)
     )
@@ -1342,10 +1305,7 @@ _REMOTE_FILE_SIZES_SNIPPET = (
     "\nif p.is_dir():"
     "\n for f in p.iterdir():"
     "\n  if f.is_file(): sizes[f.name]=f.stat().st_size"
-    # One level deep only — matches _local_file_sizes: a safetensors index can
-    # reference an auxiliary shard in a subdirectory (e.g. OptiQ's
-    # optiq/optiq_vision.safetensors), but recursing further would walk into
-    # .cache/huggingface's download bookkeeping.
+    # One level deep only, like local_file_sizes.
     "\n  elif f.is_dir() and not f.name.startswith('.'):"
     "\n   for n in f.iterdir():"
     "\n    if n.is_file(): sizes[f'{f.name}/{n.name}']=n.stat().st_size"
@@ -1437,7 +1397,7 @@ def stage_remote_files(
     *,
     model_path: str | Path,
     destination_host: str,
-    destination_dir: str | None = None,
+    destination_dir: str,
     sidecars: Sequence[str] = (),
     parallel: int = _DEFAULT_PARALLEL,
     transfer: Any = scp_push,
@@ -1451,21 +1411,22 @@ def stage_remote_files(
     direction unambiguous (local source → explicit destination), supports any
     number of nodes, and lets the GUI show file-level progress.
 
-    ``destination_dir`` is where the files land on the peer. It defaults to the
-    coordinator's own source path, re-expressed in ``~``-form (matching
-    ``remote_model_dir``'s contract) so a caller who omits it still reaches the
-    peer's own home instead of a path that names nothing there.
+    ``destination_dir`` is where the files land on the peer. It must be an
+    absolute path on the peer: ``scp_push`` expands ``~`` on the coordinator.
     """
 
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()
-    destination_dir = destination_dir or home_relative_model_path(str(source))
-    expected = {
-        path.name: path.stat().st_size
-        for path in source.iterdir()
-        if path.is_file() and (path.name in plan.required or path.name in sidecars)
-    }
+    wanted = set(plan.required) | set(sidecars)
+    source_sizes = local_file_sizes(source)
+    absent = sorted(wanted - source_sizes.keys())
+    if absent:
+        raise RuntimeError(
+            f"cannot stage {', '.join(absent)}: not found in {source}. "
+            "Check the model directory, then run staging again."
+        )
+    expected = {name: size for name, size in source_sizes.items() if name in wanted}
     present = present_reader(destination_host, destination_dir)
     missing = tuple(
         name for name, size in expected.items() if present.get(name) != size
