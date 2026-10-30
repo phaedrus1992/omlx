@@ -1132,16 +1132,9 @@ def stage_files_from_source(
     expected = dict(expected_sizes)
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
-    def _unsafe_name(name: str) -> bool:
-        try:
-            _validate_safe_relative_filename(name)
-        except ValueError:
-            return True
-        return False
-
     if any(
         not isinstance(name, str)
-        or _unsafe_name(name)
+        or not _is_safe_relative_filename(name)
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size < 0
