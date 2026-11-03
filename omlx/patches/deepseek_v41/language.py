@@ -834,9 +834,10 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
 
 
 def hc_mixes(x, fn, scale, base, c):
+    # One row keeps the FP32 GEMV. Multi-row MLX matmuls run at TF32 on M5.
     if (
         x.ndim == 4
-        and x.shape[1] >= 256
+        and x.shape[1] >= 2
         and x.shape[-2] == c.hc_mult == 4
         and x.shape[-1] > 0
         and x.dtype == mx.bfloat16
@@ -1072,6 +1073,77 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             (i for i, layer in stage if i > layer_id and "engram" in layer), None
         )
 
+    def prefetch_engram(self, next_ids, current_ids, cache=None):
+        """Start the next prefill chunk's first Engram table while this chunk runs.
+
+        Table 0 is consumed immediately after layer 0; the next chunk's read
+        otherwise starts only at its first Engram layer. Hashes and history are
+        already known at the chunk boundary, so a byte-bounded worker can finish
+        the read during this chunk's GPU work. The carry stays in a separate
+        manager until the next forward activates it; the current forward's drain
+        cannot discard it.
+        """
+        hasher = getattr(self, "_hasher", None)
+        current = getattr(self, "_engram_prefetch", None)
+        following = getattr(self, "_engram_next_prefetch", None)
+        if hasher is None or current is None or following is None:
+            return
+        current_ids = np.asarray(current_ids, dtype=np.int64)
+        next_ids = np.asarray(next_ids, dtype=np.int64)
+        if current_ids.ndim != 2 or next_ids.ndim != 2:
+            return
+        if current_ids.shape[1] == 0:
+            # A new request's first chunk starts with no active rows; discard
+            # any stale carry left by a different request before installing the
+            # current table read.
+            following.drain()
+            current_ids_are_empty = True
+        else:
+            current_ids_are_empty = False
+            if following.has_pending():
+                # Activate the carry that belongs to this chunk. A carry from
+                # another request can still be installed; its requested IDs
+                # will mismatch at the layer and fall back to a synchronous read.
+                self._engram_prefetch, self._engram_next_prefetch = (
+                    following,
+                    current,
+                )
+                current, following = following, current
+                current.activate()
+        if next_ids.shape[1] == 0:
+            return
+        stage = self._stage()
+        first = self._next_engram(stage, -1)
+        if first is None:
+            return
+        engram_ids = list(self._config.engram_layer_ids)
+        ix = engram_ids.index(first)
+        depth = self._config.engram_max_ngram_size - 1
+        history = None
+        if cache:
+            try:
+                history = np.asarray(cache[0][6], dtype=np.int64)
+            except (IndexError, TypeError, ValueError):
+                history = None
+        batch = int(next_ids.shape[0])
+        if history is None or history.ndim != 2 or history.shape[0] != batch:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        elif history.shape[1] != depth:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        if not current_ids_are_empty:
+            if current_ids.shape[0] != batch:
+                history = np.full((batch, depth), -1, dtype=np.int64)
+            else:
+                tokens = hasher.token_map[current_ids]
+                history = np.concatenate([history, tokens], axis=1)[:, -depth:]
+        hashes, _ = hasher(next_ids, history)
+        ids = hashes[:, :, ix]
+        embed = self.layers[first].engram.embed
+        if current_ids_are_empty:
+            current.submit(embed, ids)
+        else:
+            following.submit_carry(embed, ids)
+
     def _stage_output(self, h, pre, skip_logits):
         """Hand the stage to the next rank, then logits from rank 0's hidden."""
         if self.pipeline_rank != 0:
@@ -1082,12 +1154,14 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         return x if skip_logits else project_logits(x, self.head.weight)
 
     def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
-        """One token for each of 2..MAX_BATCH requests, all at a valid position, through
-        layers the fused decode supports: run the layers once for the whole batch."""
+        """One token per request at a valid position, through supported fused layers.
+
+        Batches wider than the fused kernels are split into MAX_BATCH-row chunks.
+        """
         b_n = input_ids.shape[0]
         if not (
             input_ids.shape[1] == 1
-            and 2 <= b_n <= decode_fused.MAX_BATCH
+            and b_n >= 2
             and inputs_embeds is None
             and not capture
             and kwargs.get("mtp_verify_states") is None
@@ -1145,7 +1219,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         return agreed
 
     def _forward_decode_batched(self, input_ids, cache, skip_logits=False):
-        """_forward for B single-token requests with the weights read once per step.
+        """_forward for B single-token requests with weights shared within each chunk.
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
         cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
@@ -1155,6 +1229,21 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         """
         c = self._config
         b_n = input_ids.shape[0]
+        if b_n > decode_fused.MAX_BATCH:
+            results, rows = [], [[] for _ in cache]
+            for start in range(0, b_n, decode_fused.MAX_BATCH):
+                end = min(start + decode_fused.MAX_BATCH, b_n)
+                chunk = [
+                    DeepseekV41Cache.merge([item.extract(r) for r in range(start, end)])
+                    for item in cache
+                ]
+                results.append(self._forward_decode_batched(input_ids[start:end], chunk, skip_logits))
+                for i, item in enumerate(chunk):
+                    rows[i].extend(item.extract(r) for r in range(end - start))
+            for item, updated in zip(cache, rows):
+                item.adopt_rows(updated)
+                item.advance(1)
+            return mx.concatenate(results, axis=0)
         rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
         starts = []
         for rc in rcs:
