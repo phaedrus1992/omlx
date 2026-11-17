@@ -250,7 +250,6 @@ def choose_parallelism(
 
     warnings: list[str] = []
     last_error: PlanningError | None = None
-    slow_transport_degree: int | None = None
 
     for tensor_parallel_size in candidates:
         fast_enough = transports_are_fast_enough(
@@ -265,8 +264,6 @@ def choose_parallelism(
             and not fast_enough
             and not measured_on_this_path
         ):
-            if slow_transport_degree is None:
-                slow_transport_degree = tensor_parallel_size
             continue
         try:
             plan = plan_hybrid(
@@ -343,20 +340,14 @@ def choose_parallelism(
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
         )
-    if slow_transport_degree is not None:
-        # The link is the reason, not divisibility: pipeline (degree 1) was
-        # already removed above for a model without a pipeline forward path.
-        raise PlanningError(
-            f"tensor-parallel degree {slow_transport_degree} divides "
-            f"{len(nodes)} nodes across architecture dimensions "
-            f"{model.tensor_parallel_divisors} cleanly, but the detected "
-            f"link is not fast enough to carry tensor-parallel traffic, and "
-            f"this architecture does not support pipeline parallelism as a "
-            f"fallback"
-        )
+    # Only the link gate skips a candidate without recording an error.
     raise PlanningError(
-        f"no tensor-parallel degree divides {len(nodes)} nodes across "
-        f"architecture dimensions {model.tensor_parallel_divisors}"
+        f"tensor parallelism across {len(nodes)} nodes was not attempted "
+        "because the detected link is too slow for it, and this "
+        "architecture cannot use pipeline stages instead. Detected link: "
+        f"{describe_transports(transports)}. Choose the Tensor strategy "
+        "explicitly to proceed anyway, or check the connection between "
+        "the nodes."
     )
 
 

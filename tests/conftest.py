@@ -110,6 +110,7 @@ _GPU_SERIAL_TESTS = {
     "test_qwen35_moe_verify_window.py": {
         "test_batched_decode_rows_equal_one_token_decode",
         "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_quantized_router_window_rows_equal_one_token_decode",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
         "test_window_rows_equal_one_token_decode",
@@ -493,6 +494,15 @@ def _reset_batched_decode_qmm():
     module = sys.modules.get("omlx.patches.batched_decode_qmm")
     if module is not None:
         module.remove_batched_decode_qmm_patch()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_discovery_links(monkeypatch):
+    """Classify discovered links by RTT, not by this machine's routing table."""
+    discovery = sys.modules.get("omlx.cluster.discovery")
+    if discovery is not None:
+        monkeypatch.setattr(discovery, "interface_link", lambda ip: None)
+    yield
 
 
 @pytest.fixture(autouse=True)

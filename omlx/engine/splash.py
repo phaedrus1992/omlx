@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
+from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
 from .base import BaseEngine, GenerationOutput
@@ -149,6 +150,10 @@ FLASH_NEXT_VERSION = (1, 4, 0)
 SPLIT_GGUF_VERSION = (1, 4, 0)
 # Splash 1.4.1 serves MoE GGUFs pruned to a multiple of 8 routed experts.
 PRUNED_EXPERTS_VERSION = (1, 4, 1)
+# Splash 1.6.1 adds --activations; older launchers reject the flag. From that
+# release on M5+ `auto` quantizes attention queries to int8, so oMLX pins bf16
+# by default and only sends the flag where it is understood.
+ACTIVATIONS_VERSION = (1, 6, 1)
 _PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
@@ -303,6 +308,10 @@ class SplashBinary:
     def loads_nvidia_quantization(self) -> bool:
         return self.version_tuple >= NVIDIA_QUANTIZATION_VERSION
 
+    @property
+    def accepts_activations(self) -> bool:
+        return self.version_tuple >= ACTIVATIONS_VERSION
+
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
@@ -313,7 +322,12 @@ def _version_tuple(version: str) -> tuple[int, int, int] | None:
 
 
 def _executable(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
+    # is_file() suppresses ENOENT but not PermissionError from an unreadable
+    # parent directory; an unreadable candidate means "not found" here.
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
 
 
 def _find_launcher(name: str) -> Path | None:
@@ -995,6 +1009,7 @@ class _LiveRequest:
     first_token_at: float | None = None
     last_token_at: float | None = None
     generated_tokens: int = 0
+    decode_marks: DecodeMarks = ()
 
     def add_progress(self, progress: dict[str, Any]) -> None:
         self.prompt_tokens = int(progress.get("total", self.prompt_tokens))
@@ -1003,6 +1018,9 @@ class _LiveRequest:
         self.prefill_ms = float(progress.get("time_ms", self.prefill_ms))
 
     def add_tokens(self, count: int, now: float) -> None:
+        self.decode_marks = add_decode_mark(
+            self.decode_marks, self.generated_tokens, self.last_token_at, now
+        )
         self.first_token_at = self.first_token_at or now
         self.last_token_at = now
         self.generated_tokens += count
@@ -1028,7 +1046,13 @@ class _LiveRequest:
             "request_id": request_id,
             "elapsed_seconds": elapsed,
             "generated_tokens": self.generated_tokens,
-            "tokens_per_second": self.generated_tokens / elapsed if elapsed else 0.0,
+            "tokens_per_second": live_decode_rate(
+                self.decode_marks,
+                self.generated_tokens,
+                self.last_token_at,
+                self.first_token_at,
+                now,
+            ),
             "last_activity_age_seconds": max(0.0, now - self.last_token_at),
             "prompt_tokens": self.prompt_tokens,
             "max_tokens": self.max_tokens,
@@ -1194,6 +1218,7 @@ class SplashOptions:
     kv_format: str = "int8"
     state_format: str = "fp32"
     decode_share: float | None = None
+    activations: str = "bf16"
     ane_prefill: bool = True
     cache_disk_bytes: int = 0
     cache_dir: Path | None = None
@@ -1271,8 +1296,11 @@ class SplashEngine(BaseEngine):
         value = (self._status or {}).get("maximum_context_tokens")
         return value if isinstance(value, int) and value > 0 else None
 
+    def active_request_count(self) -> int:
+        return self._active
+
     def has_active_requests(self) -> bool:
-        return self._active > 0
+        return self.active_request_count() > 0
 
     @property
     def ssd_cache_dir(self) -> Path | None:
@@ -1340,6 +1368,10 @@ class SplashEngine(BaseEngine):
             "--kv-format",
             options.kv_format,
         ]
+        # Splash defaults to auto; only an explicit bf16 needs the flag, and
+        # launchers before 1.6.1 would refuse to start on it.
+        if options.activations != "auto" and self._target.binary.accepts_activations:
+            command += ["--activations", options.activations]
         if model != self._repo_id:
             command += ["--served-model-name", self._repo_id]
         if not self._vision:
@@ -1383,6 +1415,9 @@ class SplashEngine(BaseEngine):
                 "--cache-dir",
                 str(options.cache_dir),
             ]
+        else:
+            # Without the flag Splash keeps its own auto-sized SSD cache.
+            command += ["--max-cache-disk", "0"]
         return command
 
     async def start(self) -> None:
@@ -1428,11 +1463,17 @@ class SplashEngine(BaseEngine):
         """Keep the last /status snapshot for the synchronous getters."""
         if self._client is None:
             return
+        task = asyncio.current_task()
+        cancelling = task.cancelling()
         try:
             response = await self._client.get("/status", timeout=2)
             response.raise_for_status()
             data = response.json()
         except Exception:
+            # Older anyio turns a cancel that lands with the request deadline
+            # into a timeout error; keep it a cancel so stop() can finish.
+            if task.cancelling() > cancelling:
+                raise asyncio.CancelledError from None
             logger.debug("Splash: failed to fetch /status", exc_info=True)
             return
         if not isinstance(data, dict):
@@ -1802,7 +1843,8 @@ class SplashEngine(BaseEngine):
     def benchmark_endpoint(self) -> dict[str, Any]:
         """Splash's own API, for the admin benchmark's chat-endpoint path.
 
-        Thinking is off so the benchmark measures plain prefill and decode.
+        Thinking is off so the benchmark measures plain prefill and decode, and
+        EOS is ignored so each test decodes its full token budget.
         """
         if self._process is None or self._process.poll() is not None:
             raise RuntimeError("Splash engine is not started")
@@ -1810,7 +1852,7 @@ class SplashEngine(BaseEngine):
             "base_url": f"{self._base_url}/v1",
             "api_key": self._api_key,
             "model": self._repo_id,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
     def reserved_bytes(self) -> int:

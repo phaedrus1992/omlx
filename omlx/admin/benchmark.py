@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -20,7 +20,10 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from ..custom_kernels.quant_matmul import fast as quant_fast
 from ..model_discovery import model_display_name
+from ..model_settings import a8_prefill_on, ced_prefill_on, oq_a8_model_supported
+from ..prefill_helper.manager import PrefillHelperManager
 from ..utils.proc_memory import get_lifetime_max_phys_footprint
 from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
@@ -39,6 +42,10 @@ _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
 VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
+
+# Default token generation length for any request. Runs at a different
+# length stay out of the community leaderboard (see run_benchmark).
+DEFAULT_GENERATION_LENGTH = 128
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
@@ -111,7 +118,7 @@ class BenchmarkRequest(BaseModel):
 
     model_id: str
     prompt_lengths: list[int]
-    generation_length: int = 128
+    generation_length: int = DEFAULT_GENERATION_LENGTH
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
@@ -133,6 +140,15 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid prompt length {pl}. Must be one of {VALID_PROMPT_LENGTHS}"
                 )
         return sorted(v)
+
+    @field_validator("generation_length")
+    @classmethod
+    def validate_generation_length(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"Generation length ({v}) must be higher than 0"
+            )
+        return v
 
     @field_validator("batch_sizes")
     @classmethod
@@ -363,6 +379,12 @@ _UPLOADED_SETTING_FIELDS = (
     "turboquant_skip_last",
     "a8_prefill_enabled",
     "a8_prefill_min_tokens",
+    "activation_fp16_enabled",
+    "gpu_power_limit_w",
+    "deepseek_v41_ced_prefill_enabled",
+    "deepseek_v41_engram_ssd_offload",
+    "qwen4_ple_ssd_offload",
+    "qwen4_gdn_decode_wide_proj",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
     "specprefill_enabled",
@@ -415,8 +437,19 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
 _MAX_UPLOADED_SETTINGS_BYTES = 6144
 
 
-def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
-    """Project model settings onto the uploadable allowlist."""
+# Settings that only one model family reads.
+_FAMILY_SETTING_PREFIXES = {"deepseek_v41_": "deepseek_v41", "qwen4_": "qwen4_exp"}
+_PREFILL_HELPER_WAIT_S = 600.0
+
+
+def _filter_uploaded_settings(
+    model_settings: Any, model_type: str | None = None
+) -> dict | None:
+    """Project model settings onto the uploadable allowlist.
+
+    With ``model_type``, settings of other model families are dropped and
+    toggles left unset report the value the model runs with.
+    """
     to_dict = getattr(model_settings, "to_dict", None)
     if not callable(to_dict):
         return None
@@ -434,6 +467,20 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
         if key in _PATH_VALUED_SETTING_FIELDS and isinstance(value, str):
             value = os.path.basename(value.rstrip("/")) or value
         filtered[key] = value
+    if model_type is not None:
+        for key in list(filtered):
+            for prefix, family in _FAMILY_SETTING_PREFIXES.items():
+                if key.startswith(prefix) and model_type != family:
+                    del filtered[key]
+        if oq_a8_model_supported(model_type):
+            filtered["a8_prefill_enabled"] = a8_prefill_on(model_settings)
+        else:
+            filtered.pop("a8_prefill_enabled", None)
+            filtered.pop("a8_prefill_min_tokens", None)
+        if model_type == "deepseek_v41":
+            filtered["deepseek_v41_ced_prefill_enabled"] = ced_prefill_on(
+                model_settings
+            )
 
     if len(json.dumps(filtered, separators=(",", ":"))) > _MAX_UPLOADED_SETTINGS_BYTES:
         logger.warning(
@@ -449,6 +496,90 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
             if key in raw:
                 filtered[key] = raw[key]
     return filtered
+
+
+def _setting_feature_flags(
+    model_settings: Any, model_type: str | None, *, helper_a8: bool = False
+) -> list[dict]:
+    """Speed features this model runs with.
+
+    A8 counts only where it runs: on this Mac's kernels or the helper's layers.
+    """
+    flags = []
+    if (
+        oq_a8_model_supported(model_type)
+        and a8_prefill_on(model_settings)
+        and (quant_fast.oq_a8_available() or helper_a8)
+    ):
+        flags.append({"key": "a8_prefill", "label": "INT8 Activation Prefill"})
+    if model_type == "deepseek_v41" and ced_prefill_on(model_settings):
+        flags.append({"key": "ced_prefill", "label": "CED Prefill"})
+    if model_type == "qwen4_exp" and getattr(
+        model_settings, "qwen4_gdn_decode_wide_proj", False
+    ):
+        flags.append(
+            {"key": "qwen4_wide_decode", "label": "Qwen4 Extended Fused Decode"}
+        )
+    if getattr(model_settings, "activation_fp16_enabled", False):
+        flags.append({"key": "activation_fp16", "label": "Float16 Activations"})
+    return flags
+
+
+def _prefill_helper_details(engine: Any) -> dict | None:
+    """The Prefill Accelerator a loaded model uses right now, if any.
+
+    Hardware only; the helper Mac's name and node id stay local.
+    """
+    manager = getattr(engine, "prefill_helper", None)
+    if not isinstance(manager, PrefillHelperManager):
+        return None
+    status = manager.status()
+    if status.get("state") not in ("ready", "working"):
+        return None
+    memory = status.get("memory")
+    return {
+        "helper": status.get("device"),
+        "helper_memory_gb": round(memory / 2**30) if memory else None,
+        "layers": status.get("held"),
+        "split": "auto" if manager.fixed_layers is None else "fixed",
+        "link": status.get("link"),
+        "a8": manager.a8_min_tokens is not None,
+    }
+
+
+async def _wait_for_prefill_helper(run: Any, engine: Any) -> dict | None:
+    """Wait for the chosen helper so every test runs with it, or give up."""
+    manager = getattr(engine, "prefill_helper", None)
+    if not isinstance(manager, PrefillHelperManager):
+        return None
+    deadline = time.monotonic() + _PREFILL_HELPER_WAIT_S
+    announced = False
+    while time.monotonic() < deadline:
+        status = manager.status()
+        details = _prefill_helper_details(engine)
+        if details is not None:
+            return details
+        if status.get("state") in ("error", "stopped", "needs_files"):
+            break
+        if not announced and status.get("name"):
+            announced = True
+            await _send_event(
+                run,
+                {
+                    "type": "progress",
+                    "phase": "load",
+                    "message": "Waiting for the Prefill Accelerator on "
+                    f"{status['name']}...",
+                    "current": 0,
+                    "total": 0,
+                },
+            )
+        await asyncio.sleep(1.0)
+    logger.info(
+        "Benchmark: Prefill Accelerator not ready (%s); running without it",
+        manager.status().get("state"),
+    )
+    return None
 
 
 def _with_benchmark_context(
@@ -694,6 +825,86 @@ def _restore_speed_priority(engine_pool: Any, previous: bool | None) -> None:
     config = getattr(engine_pool, "_scheduler_config", None)
     if config is not None:
         config.prefill_speed_priority = previous
+
+
+def _pin_prefill_first(engine_pool: Any) -> bool | None:
+    """Turn decode fairness off for the benchmark's duration.
+
+    With fairness on, a batch test's prefills yield to the rows that already
+    decode, so the rows start seconds apart and the batch row no longer
+    measures concurrent decode. Returns the previous value for restoration,
+    or None when the pool exposes no config.
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is None:
+        return None
+    previous = bool(getattr(config, "decode_fairness", True))
+    config.decode_fairness = False
+    return previous
+
+
+def _restore_prefill_first(engine_pool: Any, previous: bool | None) -> None:
+    """Undo _pin_prefill_first (no-op when the pin never landed)."""
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is not None:
+        config.decode_fairness = previous
+
+
+async def _lift_concurrency_for_batch(engine_pool: Any, batch_size: int) -> int | None:
+    """Raise the concurrent-request cap to the batch size for the batch tests.
+
+    The scheduler admits only max_concurrent_requests rows at a time. A wider
+    batch queues and runs in waves, so the test would measure the cap and
+    not the batch size. The lift only raises the cap, stays in memory
+    (settings.json is not written) and uses the same live seam as the
+    settings page. Returns the previous cap for restoration, or None when
+    nothing changed.
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    current = getattr(config, "max_num_seqs", None)
+    apply = getattr(engine_pool, "apply_max_concurrent_requests", None)
+    if not isinstance(current, int) or isinstance(current, bool):
+        return None
+    if current >= batch_size or apply is None:
+        return None
+    await apply(batch_size)
+    logger.info(
+        f"Benchmark: max concurrent requests raised {current} -> {batch_size} "
+        "for the batch tests"
+    )
+    return current
+
+
+async def _restore_concurrency(
+    engine_pool: Any, previous: int | None, lifted: int | None
+) -> None:
+    """Undo _lift_concurrency_for_batch (no-op when the lift never landed).
+
+    A cap the user changed during the run is kept.
+    """
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if getattr(config, "max_num_seqs", None) != lifted:
+        return
+    try:
+        await engine_pool.apply_max_concurrent_requests(previous)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Benchmark: max concurrent requests restore failed: {e}")
+
+
+def _tokens_after(timeline: list[tuple[float, int]], at: float) -> int:
+    """Tokens a request produced after `at`, from its (time, count) timeline."""
+    if not timeline:
+        return 0
+    before = 0
+    for ts, count in timeline:
+        if ts > at:
+            break
+        before = count
+    return timeline[-1][1] - before
 
 
 def _get_batch_benchmark_core(engine: Any) -> Any | None:
@@ -1106,6 +1317,7 @@ async def _run_batch_test(
         tokens = 0
         prev_tokens = 0
         reported_prompt_tokens = 0
+        timeline: list[tuple[float, int]] = []
 
         request_id = await engine_core.add_request(
             prompt=prompt,
@@ -1114,9 +1326,11 @@ async def _run_batch_test(
         )
 
         async for output in engine_core.stream_outputs(request_id):
+            now = time.perf_counter()
             if first_token is None and output.completion_tokens > prev_tokens:
-                first_token = time.perf_counter()
+                first_token = now
             prev_tokens = output.completion_tokens
+            timeline.append((now, output.completion_tokens))
             if output.finished:
                 tokens = output.completion_tokens
                 reported_prompt_tokens = output.prompt_tokens
@@ -1136,6 +1350,7 @@ async def _run_batch_test(
             "first_token_abs": first_token,
             "end_abs": end,
             "completion_tokens": tokens,
+            "timeline": timeline,
         }
 
     # Submit all requests concurrently. Nothing else generates during the
@@ -1168,10 +1383,22 @@ async def _run_batch_test(
     prefill_wall_time = max_first_token - wall_start
     pp_tps = total_prompt_tokens / max(prefill_wall_time, 1e-9)
 
-    # tg TPS: total generated tokens / generation wall time
-    # Generation starts when the last request finishes prefill
+    # tg TPS: tokens generated inside the generation window / its wall time.
+    # Generation starts when the last request finishes prefill. Tokens that
+    # earlier requests produced before that point (while later requests were
+    # still queued or in prefill) are outside the window and do not count;
+    # counting them made a batch wider than the concurrency cap report about
+    # batch_size / cap times its real throughput.
     gen_wall_time = wall_end - max_first_token
-    tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
+    window_tokens = sum(_tokens_after(r["timeline"], max_first_token) for r in results)
+    tg_tps = window_tokens / max(gen_wall_time, 1e-9)
+    overlapped = sum(1 for r in results if r["end_abs"] > max_first_token)
+    if max_tokens > 1 and overlapped < batch_size:
+        logger.warning(
+            f"Benchmark batch {batch_size}x: only {overlapped} requests were "
+            "still generating when the last one started; the batch did not "
+            "run fully in parallel"
+        )
 
     return {
         "pp_tps": round(pp_tps, 1),
@@ -1276,7 +1503,17 @@ async def _run_external_batch_test(
         # response, and the window alone cannot tell a genuine decode phase
         # from a single-chunk dump.
         if decode_observed and gen_window > 0:
-            tg_tps = round(total_gen_tokens / gen_window, 1)
+            # Count only the tokens decoded inside the window. Streams report
+            # no per-token times, so each stream's share is spread evenly over
+            # its own decode span; a stream that finished before the last one
+            # started (a server that queued it) adds nothing.
+            window_tokens = 0.0
+            for s in stats_list:
+                span = s.last_content_time - s.first_content_time
+                start = max(s.first_content_time, max_first_token)
+                inside = s.last_content_time - start
+                window_tokens += s.completion_tokens * min(max(inside / span, 0.0), 1.0)
+            tg_tps = round(window_tokens / gen_window, 1)
 
     return {
         "pp_tps": pp_tps,
@@ -1822,6 +2059,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     # Throughput measurements must not be skewed by the memory-guard
     # throttle shrinking chunks; pin speed priority for the run.
     previous_speed_priority = _pin_speed_priority(engine_pool)
+    previous_decode_fairness = _pin_prefill_first(engine_pool)
+    previous_concurrency: int | None = None
+    lifted_concurrency: int | None = None
 
     try:
         run.model_settings_snapshot = _with_benchmark_context(
@@ -1832,6 +2072,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # and the produced numbers are tied to whatever was active when
         # generation actually ran.
         model_settings = None
+        entry = engine_pool.get_entry(request.model_id)
+        model_type = (
+            str(getattr(entry, "config_model_type", "") or "").replace("-", "_").lower()
+        )
         sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
             try:
@@ -1842,7 +2086,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 run.feature_flags = _derive_feature_flags(model_settings)
                 run.model_settings_snapshot = _with_benchmark_context(
                     request.context_profile,
-                    _filter_uploaded_settings(model_settings),
+                    _filter_uploaded_settings(model_settings, model_type),
                 )
             except Exception as e:
                 logger.warning(
@@ -1895,11 +2139,49 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         force_lm = request.force_lm_engine or not (
             external_vlm_mtp_active or lightning_mtp_active
         )
+        # Splash fixes its context window at launch and rejects longer
+        # requests, so grow a saved window that this run outgrows.
+        runtime_settings = None
+        saved_window = getattr(model_settings, "max_context_window", None)
+        if saved_window and engine_pool.external_engine_id(
+            request.model_id, model_settings
+        ):
+            needed_window = max(
+                max(_single_prompt_lengths(request)) + request.generation_length,
+                _warmup_prompt_tokens(request.warmup_mode) + 8,
+            )
+            if saved_window < needed_window:
+                runtime_settings = replace(
+                    model_settings, max_context_window=needed_window
+                )
+                logger.info(
+                    f"Benchmark: launching Splash with a {needed_window}-token "
+                    f"context (saved {saved_window})"
+                )
         engine = await engine_pool.get_engine(
             request.model_id,
             force_lm=force_lm,
+            runtime_settings=runtime_settings,
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
+        if model_settings is not None:
+            helper = None
+            if isinstance(getattr(model_settings, "prefill_helper_node_id", None), str):
+                helper = await _wait_for_prefill_helper(run, engine)
+            if helper is not None:
+                run.feature_flags.append(
+                    {"key": "prefill_accelerator", "label": "Prefill Accelerator"}
+                )
+                run.model_settings_snapshot["prefill_accelerator"] = {
+                    key: value for key, value in helper.items() if key != "a8"
+                }
+            run.feature_flags.extend(
+                _setting_feature_flags(
+                    model_settings,
+                    model_type,
+                    helper_a8=bool(helper and helper["a8"]),
+                )
+            )
 
         chat = _ChatBenchmark.for_engine(engine, request.context_profile)
 
@@ -2106,9 +2388,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             metrics["system_metrics"] = _sample_window(run, window_start)
             logger.info(
                 "[benchmark-pp-result] pp=%d processing_tps=%.3f "
-                "ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
+                "gen_tps=%.3f ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
                 pp_len,
                 float(metrics.get("processing_tps", 0.0) or 0.0),
+                float(metrics.get("gen_tps", 0.0) or 0.0),
                 float(metrics.get("ttft_ms", 0.0) or 0.0),
                 float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
                 int(metrics.get("cached_tokens", 0) or 0),
@@ -2141,6 +2424,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "Batch test skipped: engine does not support concurrent batching"
             )
             current_test += len(request.batch_sizes)
+
+        # Batch tests must really run batch_size requests at once: raise the
+        # concurrent-request cap for this phase (restored in finally).
+        if request.batch_sizes and batch_core is not None and chat is None:
+            lifted_concurrency = max(request.batch_sizes)
+            previous_concurrency = await _lift_concurrency_for_batch(
+                engine_pool, lifted_concurrency
+            )
 
         for batch_size in (
             request.batch_sizes if (batch_core is not None or chat is not None) else []
@@ -2230,6 +2521,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             )
             return
 
+        if request.generation_length != DEFAULT_GENERATION_LENGTH:
+            # Non-default generation lengths are used to test different
+            # scenarios; keep them out of the omlx.ai community leaderboard.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "custom_generation_length"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "custom_generation_length",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
         if chat is not None:
             # Splash runs measure a different engine; keep them out of the
             # oMLX community leaderboard.
@@ -2308,6 +2614,11 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Benchmark: sampler stop failed: {e}")
         _restore_speed_priority(engine_pool, previous_speed_priority)
+        _restore_prefill_first(engine_pool, previous_decode_fairness)
+        # Shielded: a second cancel while restoring must not leave the cap raised.
+        await asyncio.shield(
+            _restore_concurrency(engine_pool, previous_concurrency, lifted_concurrency)
+        )
 
 
 async def _run_external_benchmark(run: BenchmarkRun) -> None:
